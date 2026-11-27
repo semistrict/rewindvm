@@ -123,6 +123,9 @@ class NodeHandle:
     def restart(self) -> Dict[str, Any]:
         return self._cluster.restart(self.name)
 
+    def send_input(self, data: Union[str, bytes]) -> Dict[str, Any]:
+        return self._cluster.send_input(self.name, data)
+
     def isolate(self, *, symmetric: bool = True) -> Dict[str, Any]:
         return self._cluster.partition([self.name], None, symmetric=symmetric)
 
@@ -523,6 +526,17 @@ class Cluster:
 
     def restart(self, node: str) -> Dict[str, Any]:
         return self._call("cluster.restart", {"node": node})
+
+    def send_input(self, node: str, data: Union[str, bytes]) -> Dict[str, Any]:
+        """Injects deterministic console input into ``node``'s ``/dev/rewind-console``."""
+        if isinstance(data, bytes):
+            params: Dict[str, Any] = {
+                "node": node,
+                "data_base64": base64.b64encode(data).decode("ascii"),
+            }
+        else:
+            params = {"node": node, "data": data}
+        return self._call("cluster.send_input", params)
 
     def logs(
         self, node: str, *, stream: str = "output", since: int = 0

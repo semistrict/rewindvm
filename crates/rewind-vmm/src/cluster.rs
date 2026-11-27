@@ -533,6 +533,9 @@ enum WorkerReq {
     AdvanceIdleTo {
         target_local: u64,
     },
+    SendInput {
+        data: Vec<u8>,
+    },
     KeyframeDirect {
         parent: Option<u64>,
         store_path: PathBuf,
@@ -766,6 +769,15 @@ fn worker_loop(
                 };
                 WorkerResp::Meta(res)
             }
+            WorkerReq::SendInput { data } => {
+                let res = match machine.as_mut() {
+                    Some(m) => m
+                        .send_console_input(&data)
+                        .map(|()| NodeMeta::from_machine(m)),
+                    None => Err(anyhow!("worker has no live Machine for SendInput")),
+                };
+                WorkerResp::Meta(res)
+            }
             WorkerReq::KeyframeDirect { parent, store_path } => {
                 let res = match machine.as_mut() {
                     Some(m) => store_cache.open(&store_path).and_then(|store| {
@@ -894,6 +906,9 @@ mod proc_worker {
         },
         AdvanceIdleTo {
             target_local: u64,
+        },
+        SendInput {
+            data: Vec<u8>,
         },
         KeyframeDirect {
             parent: Option<u64>,
@@ -1092,6 +1107,7 @@ mod proc_worker {
                 WorkerReq::AdvanceIdleTo { target_local } => {
                     WireReq::AdvanceIdleTo { target_local }
                 }
+                WorkerReq::SendInput { data } => WireReq::SendInput { data },
                 WorkerReq::KeyframeDirect { parent, store_path } => {
                     WireReq::KeyframeDirect { parent, store_path }
                 }
@@ -1305,6 +1321,15 @@ mod proc_worker {
                             .advance_idle_to(target_local)
                             .map(|()| NodeMeta::from_machine(m)),
                         None => Err(anyhow!("worker has no live Machine for AdvanceIdleTo")),
+                    };
+                    WireResp::Meta(res.map_err(|e| format!("{e:#}")))
+                }
+                WireReq::SendInput { data } => {
+                    let res = match machine.as_mut() {
+                        Some(m) => m
+                            .send_console_input(&data)
+                            .map(|()| NodeMeta::from_machine(m)),
+                        None => Err(anyhow!("worker has no live Machine for SendInput")),
                     };
                     WireResp::Meta(res.map_err(|e| format!("{e:#}")))
                 }
@@ -1552,6 +1577,34 @@ impl LiveNode {
                         Ok(ok)
                     }
                     _ => bail!("unexpected response to DeliverRx from node {}", self.cfg.name),
+                }
+            }
+        }
+    }
+
+    fn send_input(&mut self, data: Vec<u8>) -> Result<()> {
+        match &mut self.backend {
+            NodeBackend::Local(opt) => {
+                if let Some(m) = opt.as_mut() {
+                    m.send_console_input(&data)?;
+                    self.meta = Some(NodeMeta::from_machine(m));
+                }
+                Ok(())
+            }
+            NodeBackend::Worker(w) => {
+                if self.meta.is_none() {
+                    return Ok(());
+                }
+                w.send(WorkerReq::SendInput { data })?;
+                match w.recv()? {
+                    WorkerResp::Meta(res) => {
+                        self.meta = Some(res?);
+                        Ok(())
+                    }
+                    _ => bail!(
+                        "unexpected response to SendInput from node {}",
+                        self.cfg.name
+                    ),
                 }
             }
         }
@@ -3314,6 +3367,15 @@ impl Cluster {
             FaultAction::Crash(idx) => {
                 if let Some(node) = self.nodes.get_mut(idx) {
                     node.crash()?;
+                }
+            }
+            FaultAction::SendInput(idx, data) => {
+                if idx < self.nodes.len() {
+                    if self.nodes[idx].is_alive() && !self.nodes[idx].is_runnable() {
+                        let wake_ns = at_ns.max(self.cluster_ns);
+                        self.advance_idle_node_to(idx, wake_ns)?;
+                    }
+                    self.nodes[idx].send_input(data)?;
                 }
             }
             FaultAction::Restart(idx) => {

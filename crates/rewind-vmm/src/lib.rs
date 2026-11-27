@@ -952,6 +952,38 @@ impl Machine {
         Ok(true)
     }
 
+    /// Immediately injects `data` into the guest's `/dev/rewind-console`
+    /// buffer and wakes the node if it is idle (used by interactive clusters
+    /// to dispatch deterministic commands into a running or restored guest).
+    pub fn send_console_input(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > pv::INPUT_MAX {
+            bail!(
+                "console input of {} bytes exceeds limit of {} bytes",
+                data.len(),
+                pv::INPUT_MAX
+            );
+        }
+        let shared = self
+            .dev
+            .shared
+            .context("the VM has not finished booting; cannot send console input")?;
+        let mut len = [0u8; 4];
+        self.dev.ram.read(shared + pv::SHARED_INPUT_LEN, &mut len)?;
+        if u32::from_le_bytes(len) != 0 {
+            bail!("previous console input has not been drained by the guest yet");
+        }
+        self.dev.ram.write(shared + pv::SHARED_INPUT, data)?;
+        self.dev
+            .ram
+            .write(shared + pv::SHARED_INPUT_LEN, &(data.len() as u32).to_le_bytes())?;
+        let _ = self.inject(pv::PENDING_INPUT)?;
+        self.dev.idle = false;
+        Ok(())
+    }
+
     /// Advances an idle cluster node's local clock to `target_local_ns`,
     /// refreshes `SHARED_NOW`, and injects `PENDING_TIMER` if its armed timer
     /// is now due.

@@ -400,6 +400,39 @@ impl Machine {
         Ok(true)
     }
 
+    /// Immediately injects `data` into the guest's `/dev/rewind-console`
+    /// buffer and wakes the node if it is idle.
+    pub fn send_console_input(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > pv::INPUT_MAX {
+            bail!(
+                "console input of {} bytes exceeds limit of {} bytes",
+                data.len(),
+                pv::INPUT_MAX
+            );
+        }
+        let shared = self
+            .dev
+            .shared
+            .context("the VM has not finished booting; cannot send console input")?;
+        let mut len = [0u8; 4];
+        self.dev
+            .ram_read(shared + pv::SHARED_INPUT_LEN, &mut len)?;
+        if u32::from_le_bytes(len) != 0 {
+            bail!("previous console input has not been drained by the guest yet");
+        }
+        self.dev.ram_write(shared + pv::SHARED_INPUT, data)?;
+        self.dev.ram_write(
+            shared + pv::SHARED_INPUT_LEN,
+            &(data.len() as u32).to_le_bytes(),
+        )?;
+        let _ = self.inject(pv::PENDING_INPUT)?;
+        self.dev.idle = false;
+        Ok(())
+    }
+
     pub fn advance_idle_to(&mut self, target_local_ns: u64) -> Result<()> {
         if target_local_ns > self.dev.clock.now {
             self.dev.clock.now = target_local_ns;

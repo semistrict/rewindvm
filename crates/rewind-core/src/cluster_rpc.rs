@@ -483,6 +483,31 @@ fn dispatch(
                 "boot_count": boot_count,
             }))
         }
+        "cluster.send_input" => {
+            use base64::Engine;
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                data: Option<String>,
+                data_base64: Option<String>,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.send_input")?;
+            let bytes = match (p.data, p.data_base64) {
+                (Some(s), None) => s.into_bytes(),
+                (None, Some(b64)) => base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .context("invalid base64 in cluster.send_input.data_base64")?,
+                _ => bail!("cluster.send_input requires exactly one of `data` or `data_base64`"),
+            };
+            let s = require_session(session)?;
+            s.send_input(&p.node, bytes)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
         "cluster.logs" => {
             #[derive(Deserialize)]
             struct P {
