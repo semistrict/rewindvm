@@ -143,16 +143,33 @@ class NodeHandle:
     async def heal(self) -> Dict[str, Any]:
         return await self._cluster.heal([self.name])
 
-    async def cat(self, path: str, *, pid: Optional[int] = None) -> str:
-        return await self._cluster.cat(self.name, path, pid=pid)
+    async def cat(
+        self, path: str, *, pid: Optional[int] = None, step: Optional[int] = None
+    ) -> str:
+        return await self._cluster.cat(self.name, path, pid=pid, step=step)
 
-    async def cat_bytes(self, path: str, *, pid: Optional[int] = None) -> bytes:
-        return await self._cluster.cat_bytes(self.name, path, pid=pid)
+    async def cat_bytes(
+        self, path: str, *, pid: Optional[int] = None, step: Optional[int] = None
+    ) -> bytes:
+        return await self._cluster.cat_bytes(self.name, path, pid=pid, step=step)
+
+    async def cat_to_file(
+        self,
+        path: str,
+        out_path: Union[str, os.PathLike[str]],
+        *,
+        pid: Optional[int] = None,
+        step: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Writes guest file ``path`` directly to ``out_path`` on disk."""
+        return await self._cluster.cat_to_file(
+            self.name, path, out_path, pid=pid, step=step
+        )
 
     async def files(
-        self, path: str, *, pid: Optional[int] = None
+        self, path: str, *, pid: Optional[int] = None, step: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        return await self._cluster.files(self.name, path, pid=pid)
+        return await self._cluster.files(self.name, path, pid=pid, step=step)
 
     async def screenshot(
         self,
@@ -187,7 +204,55 @@ class NodeHandle:
             show_input=show_input,
         )
 
-    async def logs(self, *, stream: str = "output", since: int = 0) -> List[str]:
-        return (await self._cluster.logs(self.name, stream=stream, since=since))[
-            "lines"
-        ]
+    async def export_pcap(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Exports a ``.pcap`` capture filtered to this node directly to ``path`` on disk."""
+        return await self._cluster.export_pcap(
+            path, node=self.name, from_ms=from_ms, to_ms=to_ms
+        )
+
+    async def logs(
+        self,
+        *,
+        stream: str = "output",
+        since: int = 0,
+        step: Optional[int] = None,
+    ) -> List[str]:
+        return (
+            await self._cluster.logs(self.name, stream=stream, since=since, step=step)
+        )["lines"]
+
+    async def net_events(
+        self,
+        *,
+        since: int = 0,
+        faults: bool = False,
+        drops: bool = False,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return await self._cluster.net_events(
+            since=since,
+            node=self.name,
+            faults=faults,
+            drops=drops,
+            from_ms=from_ms,
+            to_ms=to_ms,
+        )
+
+    async def ps(
+        self, *, step: Optional[int] = None, all: bool = False
+    ) -> Dict[str, Any]:
+        return await self._cluster.ps(self.name, step=step, all=all)
+
+    async def events(
+        self, *, from_step: Optional[int] = None, to_step: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        return await self._cluster.events(
+            self.name, from_step=from_step, to_step=to_step
+        )

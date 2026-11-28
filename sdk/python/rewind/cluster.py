@@ -58,10 +58,14 @@ class Cluster:
         seed: Optional[int] = None,
         schedule: Optional[int] = None,
         epoch: Optional[int] = None,
+        faults: Optional[Sequence[Dict[str, Any]]] = None,
+        fault_window_from_ms: Optional[int] = None,
+        fault_window_until_ms: Optional[int] = None,
         nemesis: Optional[Union[Nemesis, Dict[str, Any]]] = None,
         nemesis_enabled: Optional[bool] = None,
         keyframes: Optional[bool] = None,
         echo: bool = False,
+        wall_timeout_ms: Optional[int] = None,
         clock: Optional[str] = None,
         cpu: Optional[str] = None,
         rewind_bin: Optional[str] = None,
@@ -91,10 +95,14 @@ class Cluster:
         self._seed = seed
         self._schedule = schedule
         self._epoch = epoch
+        self._faults = list(faults) if faults is not None else []
+        self._fault_window_from_ms = fault_window_from_ms
+        self._fault_window_until_ms = fault_window_until_ms
         self._nemesis = nemesis.to_dict() if isinstance(nemesis, Nemesis) else nemesis
         self._nemesis_enabled = nemesis_enabled
         self._keyframes = keyframes
         self._echo = echo
+        self._wall_timeout_ms = wall_timeout_ms
         self._rpc = AsyncRpcClient(
             rewind_bin=rewind_bin or os.environ.get("REWIND_BIN") or "rewind",
             socket_path=socket_path or os.environ.get("REWIND_CLUSTER_SOCK"),
@@ -232,12 +240,20 @@ class Cluster:
             params["schedule"] = self._schedule
         if self._epoch is not None:
             params["epoch"] = self._epoch
+        if self._faults:
+            params["faults"] = self._faults
+        if self._fault_window_from_ms is not None:
+            params["fault_window_from_ms"] = self._fault_window_from_ms
+        if self._fault_window_until_ms is not None:
+            params["fault_window_until_ms"] = self._fault_window_until_ms
         if self._nemesis is not None:
             params["nemesis"] = self._nemesis
         if self._nemesis_enabled is not None:
             params["nemesis_enabled"] = self._nemesis_enabled
         if self._keyframes is not None:
             params["keyframes"] = self._keyframes
+        if self._wall_timeout_ms is not None:
+            params["wall_timeout_ms"] = self._wall_timeout_ms
 
         res = await self._rpc.call("cluster.start", params)
         self._started = True
@@ -575,37 +591,159 @@ class Cluster:
                 await self.advance(ms=delay_ms)
 
     async def logs(
-        self, node: str, *, stream: str = "output", since: int = 0
+        self,
+        node: str,
+        *,
+        stream: str = "output",
+        since: int = 0,
+        step: Optional[int] = None,
+        cluster: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self._rpc.call(
-            "cluster.logs", {"node": node, "stream": stream, "since": since}
-        )
+        params: Dict[str, Any] = {"node": node, "stream": stream, "since": since}
+        if step is not None:
+            params["step"] = step
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.logs", params)
 
-    async def net_events(self, *, since: int = 0) -> Dict[str, Any]:
-        return await self._rpc.call("cluster.net_events", {"since": since})
+    async def net_events(
+        self,
+        *,
+        since: int = 0,
+        node: Optional[str] = None,
+        faults: bool = False,
+        drops: bool = False,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"since": since}
+        if node is not None:
+            params["node"] = node
+        if faults:
+            params["faults"] = True
+        if drops:
+            params["drops"] = True
+        if from_ms is not None:
+            params["from_ms"] = from_ms
+        if to_ms is not None:
+            params["to_ms"] = to_ms
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.net_events", params)
+
+    async def ps(
+        self,
+        node: str,
+        *,
+        step: Optional[int] = None,
+        all: bool = False,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns processes alive on ``node`` at ``step`` (or the current/final step)."""
+        params: Dict[str, Any] = {"node": node, "all": all}
+        if step is not None:
+            params["step"] = step
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.ps", params)
+
+    async def events(
+        self,
+        node: str,
+        *,
+        from_step: Optional[int] = None,
+        to_step: Optional[int] = None,
+        cluster: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returns trace events recorded for ``node`` in ``[from_step, to_step]``."""
+        params: Dict[str, Any] = {"node": node}
+        if from_step is not None:
+            params["from"] = from_step
+        if to_step is not None:
+            params["to"] = to_step
+        if cluster is not None:
+            params["cluster"] = cluster
+        res = await self._rpc.call("cluster.events", params)
+        return list(res.get("events", []))
 
     async def cat_bytes(
-        self, node: str, path: str, *, pid: Optional[int] = None
+        self,
+        node: str,
+        path: str,
+        *,
+        pid: Optional[int] = None,
+        step: Optional[int] = None,
+        cluster: Optional[str] = None,
     ) -> bytes:
         params: Dict[str, Any] = {"node": node, "path": path}
         if pid is not None:
             params["pid"] = pid
+        if step is not None:
+            params["step"] = step
+        if cluster is not None:
+            params["cluster"] = cluster
         res = await self._rpc.call("cluster.cat", params)
         if not res.get("found"):
             raise FileNotFoundError(res.get("error") or f"{node}:{path} not found")
         return base64.b64decode(res["content_base64"])
 
-    async def cat(self, node: str, path: str, *, pid: Optional[int] = None) -> str:
-        return (await self.cat_bytes(node, path, pid=pid)).decode(
-            "utf-8", errors="replace"
-        )
+    async def cat(
+        self,
+        node: str,
+        path: str,
+        *,
+        pid: Optional[int] = None,
+        step: Optional[int] = None,
+        cluster: Optional[str] = None,
+    ) -> str:
+        return (
+            await self.cat_bytes(node, path, pid=pid, step=step, cluster=cluster)
+        ).decode("utf-8", errors="replace")
+
+    async def cat_to_file(
+        self,
+        node: str,
+        path: str,
+        out_path: Union[str, os.PathLike[str]],
+        *,
+        pid: Optional[int] = None,
+        step: Optional[int] = None,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Writes guest file ``path`` directly to ``out_path`` on disk (no base64 over JSON)."""
+        params: Dict[str, Any] = {
+            "node": node,
+            "path": path,
+            "out_path": os.fspath(out_path),
+        }
+        if pid is not None:
+            params["pid"] = pid
+        if step is not None:
+            params["step"] = step
+        if cluster is not None:
+            params["cluster"] = cluster
+        res = await self._rpc.call("cluster.cat", params)
+        if not res.get("found"):
+            raise FileNotFoundError(res.get("error") or f"{node}:{path} not found")
+        return res
 
     async def files(
-        self, node: str, path: str, *, pid: Optional[int] = None
+        self,
+        node: str,
+        path: str,
+        *,
+        pid: Optional[int] = None,
+        step: Optional[int] = None,
+        cluster: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"node": node, "path": path}
         if pid is not None:
             params["pid"] = pid
+        if step is not None:
+            params["step"] = step
+        if cluster is not None:
+            params["cluster"] = cluster
         res = await self._rpc.call("cluster.files", params)
         if not res.get("found"):
             raise FileNotFoundError(res.get("error") or f"{node}:{path} not found")
@@ -666,6 +804,122 @@ class Cluster:
         if cluster is not None:
             params["cluster"] = cluster
         return await self._rpc.call("cluster.export_video", params)
+
+    async def export_pcap(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        node: Optional[str] = None,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Reconstructs a full Ethernet ``.pcap`` capture directly to ``path`` on disk.
+
+        Call after :meth:`finish` (or pass ``cluster`` to export any recorded run).
+        """
+        params: Dict[str, Any] = {"path": os.fspath(path)}
+        if node is not None:
+            params["node"] = node
+        if from_ms is not None:
+            params["from_ms"] = from_ms
+        if to_ms is not None:
+            params["to_ms"] = to_ms
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.export_pcap", params)
+
+    async def run_spec(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        seed: Optional[int] = None,
+        schedule: Optional[int] = None,
+        epoch: Optional[int] = None,
+        mem_mib: Optional[int] = None,
+        cores: Optional[int] = None,
+        max_virtual_ms: Optional[int] = None,
+        nemesis_enabled: Optional[bool] = None,
+        keyframes: Optional[bool] = None,
+        echo: bool = False,
+        wall_timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Boots and records a cluster from a declarative ``.toml`` or ``.json`` spec file."""
+        params: Dict[str, Any] = {"path": os.fspath(path), "echo": echo}
+        if seed is not None:
+            params["seed"] = seed
+        if schedule is not None:
+            params["schedule"] = schedule
+        if epoch is not None:
+            params["epoch"] = epoch
+        if mem_mib is not None:
+            params["mem_mib"] = mem_mib
+        if cores is not None:
+            params["cores"] = cores
+        if max_virtual_ms is not None:
+            params["max_virtual_ms"] = max_virtual_ms
+        if nemesis_enabled is not None:
+            params["nemesis_enabled"] = nemesis_enabled
+        if keyframes is not None:
+            params["keyframes"] = keyframes
+        if wall_timeout_ms is not None:
+            params["wall_timeout_ms"] = wall_timeout_ms
+        res = await self._rpc.call("cluster.run_spec", params)
+        self._finished = True
+        self.result = res
+        return res
+
+    async def ls(self) -> List[Dict[str, Any]]:
+        """Lists recorded cluster run manifests in ``REWIND_HOME``, newest first."""
+        res = await self._rpc.call("cluster.ls")
+        return list(res.get("clusters", []))
+
+    async def show(self, cluster: Optional[str] = None) -> Dict[str, Any]:
+        """Returns the full manifest of a recorded cluster run (defaults to last finished)."""
+        params: Dict[str, Any] = {}
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.show", params)
+
+    async def remove(self, *clusters: str) -> List[str]:
+        """Removes one or more recorded cluster runs by id, prefix, name, or ``@N``."""
+        res = await self._rpc.call("cluster.remove", {"clusters": list(clusters)})
+        return list(res.get("removed", []))
+
+    async def replay(
+        self,
+        cluster: Optional[str] = None,
+        *,
+        machine: str = "every",
+    ) -> Dict[str, Any]:
+        """Replays a recorded cluster run standalone and checks bit-for-bit determinism."""
+        params: Dict[str, Any] = {"machine": machine}
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.replay", params)
+
+    async def fork(
+        self,
+        at_ms: int,
+        *,
+        schedule: int = 1,
+        seed: Optional[int] = None,
+        keyframes: bool = True,
+        echo: bool = False,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Forks a recorded cluster run from ``at_ms`` under another schedule or seed."""
+        params: Dict[str, Any] = {
+            "at_ms": at_ms,
+            "schedule": schedule,
+            "keyframes": keyframes,
+            "echo": echo,
+        }
+        if seed is not None:
+            params["seed"] = seed
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.fork", params)
 
     async def snapshot(self, name: Optional[str] = None) -> str:
         params = {"name": name} if name is not None else {}

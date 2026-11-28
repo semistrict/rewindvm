@@ -857,6 +857,16 @@ impl ClusterSession {
         self.prepared.id.as_str()
     }
 
+    pub fn node_names(&self) -> &[String] {
+        &self.node_names
+    }
+
+    /// Decodes the live trace collected so far for `node`.
+    pub fn node_trace(&self, node: &str) -> Result<Trace> {
+        let idx = self.node_index(node)?;
+        Ok(Trace::decode(&self.recorder.node_records[idx])?)
+    }
+
     pub fn node_index(&self, name: &str) -> Result<usize> {
         self.name_to_idx.get(name).copied().with_context(|| {
             format!(
@@ -1583,38 +1593,25 @@ impl ClusterSession {
         })
     }
 
-    /// Reads a file from a live node's filesystem via a non-destructive VM
-    /// clone (zero perturbation to the live simulation!).
-    pub fn cat(&mut self, node: &str, path: &str, pid: Option<u32>) -> Result<CatResult> {
-        use base64::Engine;
+    /// Reads raw file bytes from a live node's filesystem via a non-destructive
+    /// VM clone (zero perturbation to the live simulation!).
+    pub(crate) fn cat_inspection(
+        &mut self,
+        node: &str,
+        path: &str,
+        pid: Option<u32>,
+    ) -> Result<Inspection> {
         let idx = self.node_index(node)?;
         let (mut cloned, step) = self
             .cluster
             .clone_node_machine(idx, &self.recorder.node_records[idx])?;
-        match cat_on_machine(&mut cloned, step, pid, path)? {
-            Inspection::Contents(bytes) => {
-                let text = String::from_utf8(bytes.clone()).ok();
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                Ok(CatResult {
-                    found: true,
-                    content: text,
-                    content_base64: Some(b64),
-                    error: None,
-                })
-            }
-            Inspection::NotFound(msg) => Ok(CatResult {
-                found: false,
-                content: None,
-                content_base64: None,
-                error: Some(msg),
-            }),
-            Inspection::Failed(msg) => Ok(CatResult {
-                found: false,
-                content: None,
-                content_base64: None,
-                error: Some(msg),
-            }),
-        }
+        cat_on_machine(&mut cloned, step, pid, path)
+    }
+
+    /// Reads a file from a live node's filesystem via a non-destructive VM
+    /// clone (zero perturbation to the live simulation!).
+    pub fn cat(&mut self, node: &str, path: &str, pid: Option<u32>) -> Result<CatResult> {
+        cat_result_from_inspection(self.cat_inspection(node, path, pid)?)
     }
 
     /// Lists a directory inside a live node's filesystem via a non-destructive
@@ -1624,34 +1621,7 @@ impl ClusterSession {
         let (mut cloned, step) = self
             .cluster
             .clone_node_machine(idx, &self.recorder.node_records[idx])?;
-        match list_on_machine(&mut cloned, step, pid, path)? {
-            Inspection::Contents(bytes) => {
-                let Some(listing) = Listing::parse(&bytes) else {
-                    bail!("VM returned malformed directory listing for {path}");
-                };
-                let entries = listing
-                    .entries
-                    .into_iter()
-                    .map(|e| FileEntry {
-                        path: e.path,
-                        kind: format!("{:?}", e.kind).to_lowercase(),
-                        mode: e.mode,
-                        size: e.size,
-                        target: e.target,
-                    })
-                    .collect();
-                Ok(FilesResult {
-                    found: true,
-                    entries,
-                    error: None,
-                })
-            }
-            Inspection::NotFound(msg) | Inspection::Failed(msg) => Ok(FilesResult {
-                found: false,
-                entries: Vec::new(),
-                error: Some(msg),
-            }),
-        }
+        files_result_from_inspection(path, list_on_machine(&mut cloned, step, pid, path)?)
     }
 
     /// Captures a named whole-cluster snapshot (VMs + switch + recorded faults
@@ -2027,6 +1997,59 @@ impl ClusterSession {
         }
 
         Ok(ClusterRun { dir, manifest })
+    }
+}
+
+pub(crate) fn cat_result_from_inspection(insp: Inspection) -> Result<CatResult> {
+    use base64::Engine;
+    match insp {
+        Inspection::Contents(bytes) => {
+            let text = String::from_utf8(bytes.clone()).ok();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(CatResult {
+                found: true,
+                content: text,
+                content_base64: Some(b64),
+                error: None,
+            })
+        }
+        Inspection::NotFound(msg) | Inspection::Failed(msg) => Ok(CatResult {
+            found: false,
+            content: None,
+            content_base64: None,
+            error: Some(msg),
+        }),
+    }
+}
+
+pub(crate) fn files_result_from_inspection(path: &str, insp: Inspection) -> Result<FilesResult> {
+    match insp {
+        Inspection::Contents(bytes) => {
+            let Some(listing) = Listing::parse(&bytes) else {
+                bail!("VM returned malformed directory listing for {path}");
+            };
+            let entries = listing
+                .entries
+                .into_iter()
+                .map(|e| FileEntry {
+                    path: e.path,
+                    kind: format!("{:?}", e.kind).to_lowercase(),
+                    mode: e.mode,
+                    size: e.size,
+                    target: e.target,
+                })
+                .collect();
+            Ok(FilesResult {
+                found: true,
+                entries,
+                error: None,
+            })
+        }
+        Inspection::NotFound(msg) | Inspection::Failed(msg) => Ok(FilesResult {
+            found: false,
+            entries: Vec::new(),
+            error: Some(msg),
+        }),
     }
 }
 
