@@ -245,6 +245,24 @@ const _: () = assert!(SHARED_FB_WIDTH == 3336);
 const _: () = assert!(SHARED_FB_SIZE == 3348);
 const _: () = assert!(SHARED_FB_SIZE + 4 <= crate::layout::PAGE_SIZE as u64);
 
+/// Paravirtual HID input ring (`/dev/input/event0` absolute pointer +
+/// `/dev/input/event1` keyboard):
+/// - `PENDING_HID` wakes the guest to drain Linux `evdev` `(type, code, value)`
+///   triplets from `hid_ring`.
+pub const PENDING_HID: u32 = 1 << 7;
+pub const HID_SLOTS: u32 = 32;
+pub const HID_EVENT_SIZE: u64 = 8;
+pub const SHARED_HID_PROD: u64 = SHARED_FB_SIZE + 4;
+pub const SHARED_HID_CONS: u64 = SHARED_HID_PROD + 4;
+pub const SHARED_HID_RING: u64 = SHARED_HID_CONS + 4;
+
+const _: () = assert!(SHARED_HID_PROD == 3352);
+const _: () = assert!(SHARED_HID_CONS == 3356);
+const _: () = assert!(SHARED_HID_RING == 3360 && SHARED_HID_RING.is_multiple_of(8));
+const _: () = assert!(
+    SHARED_HID_RING + (HID_SLOTS as u64) * HID_EVENT_SIZE <= crate::layout::PAGE_SIZE as u64
+);
+
 /// Whether a guest kernel that names interface `version` is one this
 /// monitor runs: its own, and no other.
 pub fn check_interface(version: u32) -> anyhow::Result<()> {

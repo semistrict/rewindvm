@@ -22,6 +22,7 @@
 #include <linux/fs_struct.h>
 #include <linux/hardirq.h>
 #include <linux/init.h>
+#include <linux/input.h>
 #include <linux/irq.h>
 #include <linux/kfifo.h>
 #include <linux/kstrtox.h>
@@ -211,6 +212,14 @@ struct rewind_tasks {
 	u64 pt_regs;
 };
 
+#define REWIND_HID_SLOTS	32
+
+struct rewind_hid_event {
+	u16 type;
+	u16 code;
+	s32 value;
+};
+
 struct rewind_shared {
 	u64 now;
 	u64 epoch;
@@ -254,6 +263,14 @@ struct rewind_shared {
 	u32 fb_height;
 	u32 fb_stride;
 	u32 fb_size;
+	/*
+	 * Paravirtual HID input ring (/dev/input/event0 pointer + event1 keyboard).
+	 * The monitor pushes Linux evdev (type, code, value) events and signals
+	 * REWIND_PENDING_HID; the guest drains them in deterministic IRQ order.
+	 */
+	u32 hid_prod;
+	u32 hid_cons;
+	struct rewind_hid_event hid_ring[REWIND_HID_SLOTS];
 };
 
 #define REWIND_PENDING_TIMER	BIT(0)
@@ -263,6 +280,7 @@ struct rewind_shared {
 #define REWIND_PENDING_STALL	BIT(4)
 #define REWIND_PENDING_RESEED	BIT(5)
 #define REWIND_PENDING_NET	BIT(6)
+#define REWIND_PENDING_HID	BIT(7)
 
 static DEFINE_KFIFO(rewind_input, u8, 4096);
 static DECLARE_WAIT_QUEUE_HEAD(rewind_input_wait);
@@ -664,6 +682,121 @@ static int __init rewind_net_init(void)
 	return 0;
 }
 
+/*
+ * Paravirtual HID input devices (/dev/input/event0 absolute pointer and
+ * /dev/input/event1 keyboard) driven deterministically via rewind_shared.hid_ring.
+ */
+static struct input_dev *rewind_ptr_dev;
+static struct input_dev *rewind_kbd_dev;
+
+static bool rewind_hid_is_pointer(u16 type, u16 code)
+{
+	if (type == EV_ABS || type == EV_REL)
+		return true;
+	if (type == EV_KEY && code >= BTN_MOUSE && code <= BTN_TASK)
+		return true;
+	return false;
+}
+
+static void rewind_hid_irq(void)
+{
+	u32 prod = READ_ONCE(rewind_shared.hid_prod);
+	u32 cons = READ_ONCE(rewind_shared.hid_cons);
+	struct input_dev *ptr = READ_ONCE(rewind_ptr_dev);
+	struct input_dev *kbd = READ_ONCE(rewind_kbd_dev);
+	bool ptr_dirty = false;
+	bool kbd_dirty = false;
+
+	while (cons != prod) {
+		struct rewind_hid_event ev =
+			rewind_shared.hid_ring[cons % REWIND_HID_SLOTS];
+
+		if (ev.type == EV_SYN) {
+			if (ptr && ptr_dirty) {
+				input_sync(ptr);
+				ptr_dirty = false;
+			}
+			if (kbd && kbd_dirty) {
+				input_sync(kbd);
+				kbd_dirty = false;
+			}
+		} else if (rewind_hid_is_pointer(ev.type, ev.code)) {
+			if (ptr) {
+				input_event(ptr, ev.type, ev.code, ev.value);
+				ptr_dirty = true;
+			}
+		} else {
+			if (kbd) {
+				input_event(kbd, ev.type, ev.code, ev.value);
+				kbd_dirty = true;
+			}
+		}
+		cons++;
+		WRITE_ONCE(rewind_shared.hid_cons, cons);
+	}
+	if (ptr && ptr_dirty)
+		input_sync(ptr);
+	if (kbd && kbd_dirty)
+		input_sync(kbd);
+}
+
+static int __init rewind_hid_init(void)
+{
+	struct input_dev *ptr, *kbd;
+	int err, code;
+
+	ptr = input_allocate_device();
+	if (!ptr)
+		return -ENOMEM;
+	ptr->name = "Rewind Paravirtual Pointer";
+	ptr->phys = "rewind/input0";
+	ptr->id.bustype = BUS_VIRTUAL;
+	ptr->id.vendor = 0x1d6b;
+	ptr->id.product = 0x0001;
+	ptr->id.version = 1;
+	__set_bit(EV_KEY, ptr->evbit);
+	__set_bit(EV_ABS, ptr->evbit);
+	__set_bit(EV_REL, ptr->evbit);
+	__set_bit(BTN_LEFT, ptr->keybit);
+	__set_bit(BTN_RIGHT, ptr->keybit);
+	__set_bit(BTN_MIDDLE, ptr->keybit);
+	__set_bit(REL_WHEEL, ptr->relbit);
+	__set_bit(REL_HWHEEL, ptr->relbit);
+	input_set_abs_params(ptr, ABS_X, 0, 32767, 0, 0);
+	input_set_abs_params(ptr, ABS_Y, 0, 32767, 0, 0);
+	err = input_register_device(ptr);
+	if (err) {
+		input_free_device(ptr);
+		return err;
+	}
+
+	kbd = input_allocate_device();
+	if (!kbd) {
+		input_unregister_device(ptr);
+		return -ENOMEM;
+	}
+	kbd->name = "Rewind Paravirtual Keyboard";
+	kbd->phys = "rewind/input1";
+	kbd->id.bustype = BUS_VIRTUAL;
+	kbd->id.vendor = 0x1d6b;
+	kbd->id.product = 0x0002;
+	kbd->id.version = 1;
+	__set_bit(EV_KEY, kbd->evbit);
+	__set_bit(EV_REP, kbd->evbit);
+	for (code = KEY_ESC; code <= 248; code++)
+		__set_bit(code, kbd->keybit);
+	err = input_register_device(kbd);
+	if (err) {
+		input_free_device(kbd);
+		input_unregister_device(ptr);
+		return err;
+	}
+
+	WRITE_ONCE(rewind_ptr_dev, ptr);
+	WRITE_ONCE(rewind_kbd_dev, kbd);
+	return 0;
+}
+
 static void rewind_handle_irq(struct pt_regs *regs)
 {
 	u32 pending;
@@ -692,6 +825,9 @@ static void rewind_handle_irq(struct pt_regs *regs)
 
 	if (pending & REWIND_PENDING_NET)
 		rewind_net_rx_irq();
+
+	if (pending & REWIND_PENDING_HID)
+		rewind_hid_irq();
 
 	if (pending & REWIND_PENDING_INSPECT) {
 		WRITE_ONCE(rewind_inspecting, true);
@@ -859,6 +995,9 @@ void __init rewind_init_platform(void)
 	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_addr) != 3328);
 	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_width) != 3336);
 	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_size) != 3348);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, hid_prod) != 3352);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, hid_cons) != 3356);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, hid_ring) != 3360);
 	rewind_publish_tasks();
 	rewind_shared.interface = REWIND_INTERFACE;
 	rewind_shared.io_buf = __pa_symbol(rewind_io_buf);
@@ -1523,6 +1662,12 @@ static int __init rewind_events_init(void)
 
 	if (READ_ONCE(rewind_shared.net_enabled)) {
 		err = rewind_net_init();
+		if (err)
+			return err;
+	}
+
+	if (READ_ONCE(rewind_shared.fb_enabled)) {
+		err = rewind_hid_init();
 		if (err)
 			return err;
 	}

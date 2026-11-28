@@ -56,6 +56,16 @@ pub struct ScheduledFault {
     pub kind: FaultKind,
 }
 
+/// One Linux `evdev` input event triplet (`EV_SYN`, `EV_KEY`, `EV_ABS`, `EV_REL`)
+/// injected deterministically into a node's paravirtual HID ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HidEvent {
+    #[serde(rename = "type")]
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+}
+
 /// Kinds of scripted or interactive cluster faults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -86,6 +96,9 @@ pub enum FaultKind {
     /// Injects deterministic console input bytes into `node`'s
     /// `/dev/rewind-console` device.
     SendInput { node: usize, data: Vec<u8> },
+    /// Injects deterministic Linux `evdev` pointer/keyboard events into `node`'s
+    /// paravirtual HID devices (`/dev/input/event0` and `/dev/input/event1`).
+    HidEvents { node: usize, events: Vec<HidEvent> },
 }
 
 /// Schedule-seed-driven nemesis configuration for `rewind cluster check`.
@@ -252,6 +265,7 @@ pub enum FaultAction {
     Crash(usize),
     Restart(usize),
     SendInput(usize, Vec<u8>),
+    HidEvents(usize, Vec<HidEvent>),
 }
 
 /// Cumulative switch counters.
@@ -988,6 +1002,14 @@ impl NetSwitch {
                     && !data.is_empty()
                 {
                     actions.push(FaultAction::SendInput(*node, data.clone()));
+                }
+            }
+            FaultKind::HidEvents { node, events } => {
+                if *node < self.config.node_count
+                    && !self.crashed.contains(node)
+                    && !events.is_empty()
+                {
+                    actions.push(FaultAction::HidEvents(*node, events.clone()));
                 }
             }
         }

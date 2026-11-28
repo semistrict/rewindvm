@@ -488,6 +488,25 @@ impl Machine {
         Ok(())
     }
 
+    /// Injects deterministic Linux `evdev` HID events into `rewind_shared.hid_ring`
+    /// and wakes the node if it is idle.
+    pub fn send_hid_events(&mut self, events: &[crate::net::HidEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let shared = self.dev.push_hid_events(events)?;
+        if self.dirty_log == DirtyLog::On
+            && let Some(off) = shared.checked_sub(RAM_BASE)
+        {
+            let page = (off as usize) / PAGE_SIZE;
+            self.dev.monitor_dirty_pages.push(page);
+            self.checkpoints.since.insert(page as u32);
+        }
+        let _ = self.inject(pv::PENDING_HID)?;
+        self.dev.idle = false;
+        Ok(())
+    }
+
     pub fn read_framebuffer(&self) -> Result<Option<(crate::FramebufferInfo, Vec<u8>)>> {
         self.dev.read_framebuffer()
     }
