@@ -32,6 +32,7 @@ pub const MMIO_SETUP: u16 = 0x28;
 pub const MMIO_IRQ_ACK: u16 = 0x30;
 pub const MMIO_SERIAL: u16 = 0x38;
 pub const MMIO_NET_TX: u16 = 0x40;
+pub const MMIO_BLK_REQ: u16 = 0x48;
 
 /// Maps an ARM64 Rewind MMIO register offset to the shared `pv::PORT_*` /
 /// `pv::HVC_IRQ_ACK` constant.
@@ -47,6 +48,7 @@ pub const fn mmio_offset_to_port(offset: u16) -> Option<u16> {
         MMIO_IRQ_ACK => Some(pv::HVC_IRQ_ACK),
         MMIO_SERIAL => Some(pv::PORT_COM1),
         MMIO_NET_TX => Some(pv::PORT_NET_TX),
+        MMIO_BLK_REQ => Some(pv::PORT_BLK_REQ),
         _ => None,
     }
 }

@@ -203,6 +203,13 @@ pub struct NodeSpecFile {
     /// Optional framebuffer height in pixels (default 720 when `display` is true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_height: Option<u32>,
+    /// Optional crash-consistent writable ext4 virtual disk (`/dev/rwd0`) size in MiB.
+    /// Persists across `crash()` + `restart()` while dropping unflushed volatile writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_mib: Option<u64>,
+    /// Mount point inside the guest for the virtual disk (default `"/data"` when `disk_mib` is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_mount: Option<String>,
     #[serde(default)]
     pub files: Vec<NodeFileSpec>,
 }
@@ -275,6 +282,10 @@ pub struct ClusterNodeManifest {
     pub display_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_mount: Option<String>,
     pub spec: Spec,
 }
 

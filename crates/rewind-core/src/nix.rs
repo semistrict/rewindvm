@@ -606,6 +606,7 @@ impl Build {
                 .collect(),
             sandbox: self.sandbox,
             net: None,
+            disk_mount: None,
         }
     }
 }

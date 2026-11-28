@@ -1446,6 +1446,13 @@ impl ClusterSession {
         Ok(self.cluster.node_boot_count(idx))
     }
 
+    /// Returns I/O and power-loss durability statistics for `node`'s paravirtual
+    /// disk (`/dev/rwd0`), or `None` if no disk is attached.
+    pub fn disk_stats(&self, node: &str) -> Result<Option<rewind_vmm::disk::DiskStats>> {
+        let idx = self.node_index(node)?;
+        self.cluster.node_disk_stats(idx)
+    }
+
     /// Delays (clogs) all packets on `from -> to` (and optionally `to -> from`)
     /// for `duration_ns` virtual time, queueing rather than dropping them.
     pub fn clog_link(

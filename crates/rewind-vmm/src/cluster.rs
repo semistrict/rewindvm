@@ -233,6 +233,8 @@ pub struct ClusterNodeKeyframe {
     pub reset_switches_next: bool,
     #[serde(default)]
     pub reset_io_next: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<crate::disk::DiskSnapshot>,
     pub pending_rx: Vec<InFlightFrame>,
 }
 
@@ -603,6 +605,9 @@ enum WorkerReq {
     SnapshotNonDestructive,
     Encoders,
     SetEncoders(Box<EncodersPair>),
+    DiskStats,
+    DiskSnapshot,
+    RestoreDisk(Option<crate::disk::DiskSnapshot>),
     #[cfg(not(target_os = "macos"))]
     TakeMachine,
     Crash,
@@ -621,6 +626,8 @@ enum WorkerResp {
     PreparedKeyframe(Box<Result<Option<PreparedKeyframe>>>),
     NonDestructive(Box<Result<(Keyframe, MemPages, NodeEncoders)>>),
     Encoders(Box<NodeEncoders>),
+    DiskStats(Option<crate::disk::DiskStats>),
+    DiskSnapshot(Option<crate::disk::DiskSnapshot>),
     Framebuffer(Box<Result<Option<FramebufferFrame>>>),
     Unit,
     #[cfg(not(target_os = "macos"))]
@@ -703,6 +710,7 @@ fn worker_loop(
     shared_intr: Arc<Mutex<Option<Interrupter>>>,
 ) {
     let mut machine: Option<Machine> = None;
+    let mut disk: Option<Arc<Mutex<crate::disk::VirtualDisk>>> = None;
     let mut store_cache = WorkerStoreCache::default();
 
     while let Ok(req) = req_rx.recv() {
@@ -714,6 +722,14 @@ fn worker_loop(
             } => {
                 let res = (|| -> Result<NodeMeta> {
                     let mut m = Machine::boot(&config, dirty_log)?;
+                    if let Some(mib) = config.disk_mib {
+                        let d = disk
+                            .get_or_insert_with(|| {
+                                Arc::new(Mutex::new(crate::disk::VirtualDisk::new(mib)))
+                            })
+                            .clone();
+                        m.set_disk(d);
+                    }
                     m.set_cluster_mode(true);
                     if initial_local > 0 {
                         m.set_initial_now(initial_local)?;
@@ -900,6 +916,39 @@ fn worker_loop(
                 }
                 WorkerResp::Unit
             }
+            WorkerReq::DiskStats => {
+                let s = disk
+                    .as_ref()
+                    .and_then(|d| d.lock().ok().map(|g| g.stats()));
+                WorkerResp::DiskStats(s)
+            }
+            WorkerReq::DiskSnapshot => {
+                let s = disk
+                    .as_ref()
+                    .and_then(|d| d.lock().ok().map(|g| g.snapshot()));
+                WorkerResp::DiskSnapshot(s)
+            }
+            WorkerReq::RestoreDisk(snap) => {
+                match snap {
+                    Some(s) => {
+                        let d = disk
+                            .get_or_insert_with(|| {
+                                Arc::new(Mutex::new(crate::disk::VirtualDisk::new(1)))
+                            })
+                            .clone();
+                        if let Ok(mut g) = d.lock() {
+                            g.restore(&s);
+                        }
+                        if let Some(m) = machine.as_mut() {
+                            m.set_disk(d);
+                        }
+                    }
+                    None => {
+                        disk = None;
+                    }
+                }
+                WorkerResp::Unit
+            }
             WorkerReq::TakeMachine => {
                 if let Ok(mut g) = shared_intr.lock() {
                     *g = None;
@@ -913,6 +962,11 @@ fn worker_loop(
             WorkerReq::Crash => {
                 if let Ok(mut g) = shared_intr.lock() {
                     *g = None;
+                }
+                if let Some(d) = &disk
+                    && let Ok(mut g) = d.lock()
+                {
+                    g.on_power_loss();
                 }
                 let steps = machine.take().map_or(0, |m| m.step());
                 WorkerResp::Crashed(steps)
@@ -1000,6 +1054,9 @@ mod proc_worker {
         SnapshotNonDestructive,
         Encoders,
         SetEncoders(Box<EncodersPair>),
+        DiskStats,
+        DiskSnapshot,
+        RestoreDisk(Option<crate::disk::DiskSnapshot>),
         Crash,
         Interrupt,
         Shutdown,
@@ -1015,6 +1072,8 @@ mod proc_worker {
         PreparedKeyframe(Box<std::result::Result<Option<PreparedKeyframe>, String>>),
         NonDestructive(Box<std::result::Result<(Keyframe, MemPages, NodeEncoders), String>>),
         Encoders(Box<NodeEncoders>),
+        DiskStats(Option<crate::disk::DiskStats>),
+        DiskSnapshot(Option<crate::disk::DiskSnapshot>),
         Framebuffer(Box<std::result::Result<Option<FramebufferFrame>, String>>),
         Unit,
         Crashed(u64),
@@ -1108,6 +1167,8 @@ mod proc_worker {
                                 WorkerResp::NonDestructive(Box::new((*r).map_err(|e| anyhow!(e))))
                             }
                             WireResp::Encoders(e) => WorkerResp::Encoders(e),
+                            WireResp::DiskStats(s) => WorkerResp::DiskStats(s),
+                            WireResp::DiskSnapshot(s) => WorkerResp::DiskSnapshot(s),
                             WireResp::Framebuffer(r) => {
                                 WorkerResp::Framebuffer(Box::new((*r).map_err(|e| anyhow!(e))))
                             }
@@ -1201,6 +1262,9 @@ mod proc_worker {
                 WorkerReq::SnapshotNonDestructive => WireReq::SnapshotNonDestructive,
                 WorkerReq::Encoders => WireReq::Encoders,
                 WorkerReq::SetEncoders(p) => WireReq::SetEncoders(p),
+                WorkerReq::DiskStats => WireReq::DiskStats,
+                WorkerReq::DiskSnapshot => WireReq::DiskSnapshot,
+                WorkerReq::RestoreDisk(s) => WireReq::RestoreDisk(s),
                 WorkerReq::Crash => WireReq::Crash,
             };
             let mut stdin = self
@@ -1287,6 +1351,7 @@ mod proc_worker {
 
         let mut stdout = BufWriter::new(std::io::stdout().lock());
         let mut machine: Option<Machine> = None;
+        let mut disk: Option<Arc<Mutex<crate::disk::VirtualDisk>>> = None;
         let mut store_cache = WorkerStoreCache::default();
 
         while let Ok(req) = req_rx.recv() {
@@ -1303,6 +1368,14 @@ mod proc_worker {
                     drop(machine.take());
                     let res = (|| -> Result<NodeMeta> {
                         let mut m = Machine::boot(&config, dirty_log)?;
+                        if let Some(mib) = config.disk_mib {
+                            let d = disk
+                                .get_or_insert_with(|| {
+                                    Arc::new(Mutex::new(crate::disk::VirtualDisk::new(mib)))
+                                })
+                                .clone();
+                            m.set_disk(d);
+                        }
                         m.set_cluster_mode(true);
                         if initial_local > 0 {
                             m.set_initial_now(initial_local)?;
@@ -1481,9 +1554,47 @@ mod proc_worker {
                     }
                     WireResp::Unit
                 }
+                WireReq::DiskStats => {
+                    let s = disk
+                        .as_ref()
+                        .and_then(|d| d.lock().ok().map(|g| g.stats()));
+                    WireResp::DiskStats(s)
+                }
+                WireReq::DiskSnapshot => {
+                    let s = disk
+                        .as_ref()
+                        .and_then(|d| d.lock().ok().map(|g| g.snapshot()));
+                    WireResp::DiskSnapshot(s)
+                }
+                WireReq::RestoreDisk(snap) => {
+                    match snap {
+                        Some(s) => {
+                            let d = disk
+                                .get_or_insert_with(|| {
+                                    Arc::new(Mutex::new(crate::disk::VirtualDisk::new(1)))
+                                })
+                                .clone();
+                            if let Ok(mut g) = d.lock() {
+                                g.restore(&s);
+                            }
+                            if let Some(m) = machine.as_mut() {
+                                m.set_disk(d);
+                            }
+                        }
+                        None => {
+                            disk = None;
+                        }
+                    }
+                    WireResp::Unit
+                }
                 WireReq::Crash => {
                     if let Ok(mut g) = shared_intr.lock() {
                         *g = None;
+                    }
+                    if let Some(d) = &disk
+                        && let Ok(mut g) = d.lock()
+                    {
+                        g.on_power_loss();
                     }
                     let steps = machine.take().map_or(0, |m| m.step());
                     WireResp::Crashed(steps)
@@ -1529,6 +1640,9 @@ enum NodeBackend {
 struct LiveNode {
     cfg: ClusterNodeConfig,
     backend: NodeBackend,
+    /// Persistent disk owned inline for `NodeBackend::Local` (for `Worker`, the
+    /// worker thread/process owns the disk directly across reboots).
+    disk: Option<Arc<Mutex<crate::disk::VirtualDisk>>>,
     meta: Option<NodeMeta>,
     /// Cluster virtual time this node has reached.
     cluster_ns: u64,
@@ -1821,7 +1935,14 @@ impl LiveNode {
 
     fn crash(&mut self) -> Result<()> {
         let steps = match &mut self.backend {
-            NodeBackend::Local(opt) => opt.take().map_or(0, |m| m.step()),
+            NodeBackend::Local(opt) => {
+                if let Some(d) = &self.disk
+                    && let Ok(mut g) = d.lock()
+                {
+                    g.on_power_loss();
+                }
+                opt.take().map_or(0, |m| m.step())
+            }
             NodeBackend::Worker(w) => {
                 w.send(WorkerReq::Crash)?;
                 match w.recv()? {
@@ -1835,6 +1956,81 @@ impl LiveNode {
         self.paused = false;
         self.pending_rx.clear();
         Ok(())
+    }
+
+    fn disk_stats(&self) -> Result<Option<crate::disk::DiskStats>> {
+        match &self.backend {
+            NodeBackend::Local(_) => Ok(self
+                .disk
+                .as_ref()
+                .and_then(|d| d.lock().ok().map(|g| g.stats()))),
+            NodeBackend::Worker(w) => {
+                w.send(WorkerReq::DiskStats)?;
+                match w.recv()? {
+                    WorkerResp::DiskStats(s) => Ok(s),
+                    _ => bail!(
+                        "unexpected response to DiskStats from node {}",
+                        self.cfg.name
+                    ),
+                }
+            }
+        }
+    }
+
+    fn disk_snapshot(&self) -> Result<Option<crate::disk::DiskSnapshot>> {
+        match &self.backend {
+            NodeBackend::Local(_) => Ok(self
+                .disk
+                .as_ref()
+                .and_then(|d| d.lock().ok().map(|g| g.snapshot()))),
+            NodeBackend::Worker(w) => {
+                w.send(WorkerReq::DiskSnapshot)?;
+                match w.recv()? {
+                    WorkerResp::DiskSnapshot(s) => Ok(s),
+                    _ => bail!(
+                        "unexpected response to DiskSnapshot from node {}",
+                        self.cfg.name
+                    ),
+                }
+            }
+        }
+    }
+
+    fn restore_disk(&mut self, snap: Option<crate::disk::DiskSnapshot>) -> Result<()> {
+        match &mut self.backend {
+            NodeBackend::Local(opt) => {
+                match snap {
+                    Some(s) => {
+                        let d = self
+                            .disk
+                            .get_or_insert_with(|| {
+                                Arc::new(Mutex::new(crate::disk::VirtualDisk::new(1)))
+                            })
+                            .clone();
+                        if let Ok(mut g) = d.lock() {
+                            g.restore(&s);
+                        }
+                        if let Some(m) = opt.as_mut() {
+                            m.set_disk(d);
+                        }
+                    }
+                    None => {
+                        self.disk = None;
+                    }
+                }
+                Ok(())
+            }
+            NodeBackend::Worker(w) => {
+                w.send(WorkerReq::RestoreDisk(snap))?;
+                match w.recv()? {
+                    WorkerResp::Unit => Ok(()),
+                    _ => bail!(
+                        "unexpected response to RestoreDisk from node {}",
+                        self.cfg.name
+                    ),
+                }
+            }
+        }
     }
 
     fn boot_fresh(
@@ -1852,6 +2048,15 @@ impl LiveNode {
                         self.cfg.name, self.boot_count
                     )
                 })?;
+                if let Some(mib) = cfg.disk_mib {
+                    let d = self
+                        .disk
+                        .get_or_insert_with(|| {
+                            Arc::new(Mutex::new(crate::disk::VirtualDisk::new(mib)))
+                        })
+                        .clone();
+                    m.set_disk(d);
+                }
                 m.set_cluster_mode(true);
                 if initial_local > 0 {
                     m.set_initial_now(initial_local)?;
@@ -2131,6 +2336,7 @@ impl Cluster {
                 nodes.push(LiveNode {
                     cfg: node_cfg.clone(),
                     backend: NodeBackend::Worker(worker),
+                    disk: None,
                     meta: Some(meta),
                     cluster_ns: 0,
                     boot_cluster_ns: 0,
@@ -2148,8 +2354,15 @@ impl Cluster {
             }
         } else {
             for node_cfg in &config.nodes {
+                let disk = node_cfg
+                    .config
+                    .disk_mib
+                    .map(|mib| Arc::new(Mutex::new(crate::disk::VirtualDisk::new(mib))));
                 let mut m = Machine::boot(&node_cfg.config, dirty_log)
                     .with_context(|| format!("booting cluster node {}", node_cfg.name))?;
+                if let Some(d) = &disk {
+                    m.set_disk(d.clone());
+                }
                 m.set_cluster_mode(true);
                 let initial_local = (node_cfg.clock_skew_ns - min_skew_ns).max(0) as u64;
                 if initial_local > 0 {
@@ -2159,6 +2372,7 @@ impl Cluster {
                 nodes.push(LiveNode {
                     cfg: node_cfg.clone(),
                     backend: NodeBackend::Local(Some(Box::new(m))),
+                    disk,
                     meta: Some(meta),
                     cluster_ns: 0,
                     boot_cluster_ns: 0,
@@ -2269,9 +2483,10 @@ impl Cluster {
                 } else {
                     None
                 };
-                nodes.push(LiveNode {
+                let mut live = LiveNode {
                     cfg: node_cfg.clone(),
                     backend: NodeBackend::Worker(worker),
+                    disk: None,
                     meta,
                     cluster_ns: last_nk.cluster_ns,
                     boot_cluster_ns: last_nk.boot_cluster_ns,
@@ -2285,7 +2500,11 @@ impl Cluster {
                     reset_io_next: last_nk.reset_io_next,
                     last_stop: None,
                     pending_rx: last_nk.pending_rx.iter().cloned().collect(),
-                });
+                };
+                if last_nk.disk.is_some() {
+                    live.restore_disk(last_nk.disk.clone())?;
+                }
+                nodes.push(live);
             }
 
             let switch = NetSwitch::restore(config.network.clone(), last.switch.clone());
@@ -2368,9 +2587,10 @@ impl Cluster {
                 (NodeBackend::Local(machine.map(Box::new)), meta)
             };
 
-            nodes.push(LiveNode {
+            let mut live = LiveNode {
                 cfg: node_cfg.clone(),
                 backend,
+                disk: None,
                 meta,
                 cluster_ns: last_nk.cluster_ns,
                 boot_cluster_ns: last_nk.boot_cluster_ns,
@@ -2384,7 +2604,11 @@ impl Cluster {
                 reset_io_next: last_nk.reset_io_next,
                 last_stop: None,
                 pending_rx: last_nk.pending_rx.iter().cloned().collect(),
-            });
+            };
+            if last_nk.disk.is_some() {
+                live.restore_disk(last_nk.disk.clone())?;
+            }
+            nodes.push(live);
         }
 
         let switch = NetSwitch::restore(config.network.clone(), last.switch.clone());
@@ -2587,6 +2811,9 @@ impl Cluster {
             node.reset_io_next = last_nk.reset_io_next;
             node.last_stop = None;
             node.pending_rx = last_nk.pending_rx.iter().cloned().collect();
+            if last_nk.disk.is_some() || node.cfg.config.disk_mib.is_some() {
+                node.restore_disk(last_nk.disk.clone())?;
+            }
         }
         self.switch = NetSwitch::restore(self.config.network.clone(), last.switch.clone());
         self.cluster_ns = last.cluster_ns;
@@ -2694,6 +2921,7 @@ impl Cluster {
 
         let mut node_kfs = Vec::with_capacity(self.nodes.len());
         for (node, kf) in self.nodes.iter().zip(node_kfs_opt) {
+            let disk = node.disk_snapshot()?;
             node_kfs.push(ClusterNodeKeyframe {
                 keyframe: kf,
                 idle: node.meta.as_ref().is_some_and(|m| m.is_idle),
@@ -2708,6 +2936,7 @@ impl Cluster {
                 clock_drift_ppm: Some(node.clock_drift_ppm),
                 reset_switches_next: node.reset_switches_next,
                 reset_io_next: node.reset_io_next,
+                disk,
                 pending_rx: node.pending_rx.iter().cloned().collect(),
             });
         }
@@ -2734,6 +2963,13 @@ impl Cluster {
 
     pub fn node_boot_count(&self, node: usize) -> u32 {
         self.nodes.get(node).map_or(0, |n| n.boot_count)
+    }
+
+    pub fn node_disk_stats(&self, node: usize) -> Result<Option<crate::disk::DiskStats>> {
+        match self.nodes.get(node) {
+            Some(n) => n.disk_stats(),
+            None => Ok(None),
+        }
     }
 
     pub fn switch_snapshot(&self) -> NetSwitchState {

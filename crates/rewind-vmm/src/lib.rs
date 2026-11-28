@@ -22,6 +22,7 @@ pub mod control;
 pub mod cpu;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod debug;
+pub mod disk;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 pub mod interrupt;
@@ -290,6 +291,9 @@ pub struct Config {
     /// Optional paravirtual framebuffer (`/dev/fb0`) for deterministic video capture.
     #[serde(default)]
     pub fb: Option<FramebufferConfig>,
+    /// Optional crash-consistent paravirtual disk (`/dev/rwd0`) size in MiB.
+    #[serde(default)]
+    pub disk_mib: Option<u64>,
 }
 
 /// Whether KVM logs the pages the guest writes, which keyframes and
@@ -522,6 +526,8 @@ pub(crate) struct Devices {
     pub net_config: Option<NetDeviceConfig>,
     /// Paravirtual framebuffer geometry + guest physical address, if attached.
     pub fb_region: Option<FramebufferInfo>,
+    /// Optional crash-consistent paravirtual block device (`/dev/rwd0`).
+    pub disk: Option<std::sync::Arc<std::sync::Mutex<disk::VirtualDisk>>>,
     /// Guest physical address of `rewind_net_rx` (published at setup).
     pub net_rx_ring: Option<u64>,
     /// Slot count of `rewind_net_rx` (published at setup).
@@ -756,6 +762,9 @@ impl Machine {
                 event_buffer: Vec::new(),
                 net_config: config.net,
                 fb_region,
+                disk: config
+                    .disk_mib
+                    .map(|mib| std::sync::Arc::new(std::sync::Mutex::new(crate::disk::VirtualDisk::new(mib)))),
                 net_rx_ring: None,
                 net_rx_slots: 0,
                 tx_queue: std::collections::VecDeque::new(),
@@ -933,6 +942,17 @@ impl Machine {
     /// coordinator.
     pub fn set_cluster_mode(&mut self, enabled: bool) {
         self.dev.cluster_mode = enabled;
+    }
+
+    pub fn set_disk(&mut self, disk: std::sync::Arc<std::sync::Mutex<crate::disk::VirtualDisk>>) {
+        self.dev.disk = Some(disk);
+    }
+
+    pub fn disk_stats(&self) -> Option<crate::disk::DiskStats> {
+        self.dev
+            .disk
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|g| g.stats()))
     }
 
     /// Clones the in-memory I/O and context-switch trace encoders so an
@@ -1824,6 +1844,63 @@ impl Devices {
                     self.tx_pending = Some(frame);
                 }
             }
+            pv::PORT_BLK_REQ => {
+                let req_gpa = value;
+                let mut hdr = [0u8; pv::BLK_REQ_SIZE];
+                self.ram.read_gpa(req_gpa, &mut hdr)?;
+                let op = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+                let sector = u64::from_le_bytes([
+                    hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                ]);
+                let buf_gpa = u64::from_le_bytes([
+                    hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+                ]);
+                let len = u32::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]) as usize;
+
+                let status = if let Some(disk_arc) = self.disk.clone() {
+                    let mut disk = disk_arc
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("virtual disk lock poisoned"))?;
+                    match op {
+                        pv::BLK_OP_FLUSH => {
+                            disk.flush();
+                            pv::BLK_STATUS_OK
+                        }
+                        pv::BLK_OP_READ => {
+                            if len == 0 || len > pv::BLK_IO_MAX {
+                                pv::BLK_STATUS_IOERR
+                            } else {
+                                let mut buf = vec![0u8; len];
+                                if disk.read_sectors(sector, &mut buf) {
+                                    drop(disk);
+                                    self.ram_write(buf_gpa, &buf)?;
+                                    pv::BLK_STATUS_OK
+                                } else {
+                                    pv::BLK_STATUS_IOERR
+                                }
+                            }
+                        }
+                        pv::BLK_OP_WRITE | pv::BLK_OP_WRITE_FUA => {
+                            if len == 0 || len > pv::BLK_IO_MAX {
+                                pv::BLK_STATUS_IOERR
+                            } else {
+                                let mut buf = vec![0u8; len];
+                                self.ram.read_gpa(buf_gpa, &mut buf)?;
+                                let fua = op == pv::BLK_OP_WRITE_FUA;
+                                if disk.write_sectors(sector, &buf, fua) {
+                                    pv::BLK_STATUS_OK
+                                } else {
+                                    pv::BLK_STATUS_IOERR
+                                }
+                            }
+                        }
+                        _ => pv::BLK_STATUS_IOERR,
+                    }
+                } else {
+                    pv::BLK_STATUS_IOERR
+                };
+                self.ram_write(req_gpa + 4, &status.to_le_bytes())?;
+            }
             pv::PORT_TIMER => {
                 let delta = value;
                 let slack = if delta == 0 {
@@ -1899,6 +1976,17 @@ impl Devices {
                     self.ram_write(shared + pv::SHARED_FB_ENABLED, &1u32.to_le_bytes())?;
                 } else {
                     self.ram_write(shared + pv::SHARED_FB_ENABLED, &0u32.to_le_bytes())?;
+                }
+                if let Some(disk_arc) = self.disk.clone() {
+                    let sectors = disk_arc
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("virtual disk lock poisoned"))?
+                        .sectors();
+                    self.ram_write(shared + pv::SHARED_BLK_SECTORS, &sectors.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_BLK_ENABLED, &1u32.to_le_bytes())?;
+                } else {
+                    self.ram_write(shared + pv::SHARED_BLK_SECTORS, &0u64.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_BLK_ENABLED, &0u32.to_le_bytes())?;
                 }
                 self.shared = Some(shared);
                 self.io = Some(rewind_trace::io_records::Encoder::new());
@@ -2269,6 +2357,7 @@ mod tests {
             event_buffer: Vec::new(),
             net_config: None,
             fb_region: None,
+            disk: None,
             net_rx_ring: None,
             net_rx_slots: 0,
             tx_queue: std::collections::VecDeque::new(),
@@ -2715,6 +2804,7 @@ mod machine_tests {
             extras: Extras::Absent,
             net: None,
             fb: None,
+            disk_mib: None,
         }
     }
 

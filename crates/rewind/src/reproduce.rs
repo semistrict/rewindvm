@@ -273,6 +273,7 @@ pub(crate) mod tests {
             output: Output::Plain,
             sandbox: rewind_init::Sandbox::Shared,
             net: None,
+            disk_mount: None,
         }
     }
 
