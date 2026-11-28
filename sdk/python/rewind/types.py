@@ -34,33 +34,6 @@ class Nemesis:
 
 
 @dataclass
-class WaitResult:
-    matched: bool
-    line: Optional[str]
-    cluster_ns: int
-    cluster_step: int
-    node_step: int
-
-    @property
-    def cluster_ms(self) -> float:
-        return self.cluster_ns / 1_000_000.0
-
-
-@dataclass
-class WaitAnyResult:
-    matched: bool
-    node: Optional[str]
-    line: Optional[str]
-    cluster_ns: int
-    cluster_step: int
-    node_step: int
-
-    @property
-    def cluster_ms(self) -> float:
-        return self.cluster_ns / 1_000_000.0
-
-
-@dataclass
 class SignalEvent:
     """One signal or barrier arrival sent by a guest to ``http://rewind``."""
 

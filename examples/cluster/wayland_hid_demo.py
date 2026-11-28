@@ -115,9 +115,7 @@ async def main() -> None:
 
         await c.start()
         try:
-            await db.wait_for("PG_READY", from_start=True, timeout_ms=60_000)
-            await app.wait_for("Ready in", from_start=True, timeout_ms=90_000)
-            await desktop.wait_for("CHROME_LAUNCHED", from_start=True, timeout_ms=60_000)
+            await desktop.wait_signal("chrome_launched", timeout_ms=150_000)
 
             # Give Chromium virtual time to paint the Umami /login page.
             t_launch = await c.advance(ms=2500)
@@ -168,8 +166,9 @@ async def main() -> None:
                 flush=True,
             )
 
-            await desktop.send_input("DONE\n")
-            await desktop.wait_for("HID_DEMO_DONE", from_start=True, timeout_ms=15_000)
+            await desktop.wait_signal("done", barrier=True, timeout_ms=15_000)
+            await desktop.release("done")
+            await desktop.wait_signal("hid_done", timeout_ms=15_000)
             exit_res = await desktop.wait_exit(timeout_ms=15_000)
             assert exit_res["exit_code"] == 0, f"desktop exited with {exit_res}"
             run = await c.finish(verdict="passed")

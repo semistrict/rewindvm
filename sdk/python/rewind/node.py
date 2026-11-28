@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from .types import SignalEvent, WaitResult
+from .types import SignalEvent
 
 if TYPE_CHECKING:
     from .cluster import Cluster
@@ -17,26 +17,6 @@ class NodeHandle:
     def __init__(self, cluster: "Cluster", name: str) -> None:
         self._cluster = cluster
         self.name = name
-
-    async def wait_for(
-        self,
-        contains: str,
-        *,
-        stream: str = "output",
-        timeout_ms: Optional[int] = 10_000,
-        from_start: bool = False,
-        wall_timeout_ms: Optional[int] = None,
-        check: bool = True,
-    ) -> WaitResult:
-        return await self._cluster.wait_for(
-            self.name,
-            contains,
-            stream=stream,
-            timeout_ms=timeout_ms,
-            from_start=from_start,
-            wall_timeout_ms=wall_timeout_ms,
-            check=check,
-        )
 
     async def wait_exit(
         self,

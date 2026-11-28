@@ -79,17 +79,18 @@ SPECS = [
 async def run_one_spec(cluster: Cluster, spec: str) -> dict:
     t0 = time.perf_counter()
     browser = cluster.node("browser")
-    await browser.send_input(f"{spec}\n")
+    await browser.release("dispatch", spec)
 
     if spec == "db_partition_and_recover":
-        await browser.wait_for("READY_FOR_DB_FAULT", from_start=True, timeout_ms=30_000)
+        await browser.wait_signal("db_partition", barrier=True, timeout_ms=30_000)
         await cluster.partition(["db"], ["app", "browser"])
-        await browser.send_input("PARTITIONED\n")
-        await browser.wait_for("DB_FAULT_OBSERVED", from_start=True, timeout_ms=30_000)
+        await browser.release("db_partition")
+        await browser.wait_signal("db_heal", barrier=True, timeout_ms=30_000)
         await cluster.heal()
-        await browser.send_input("HEALED\n")
+        await browser.release("db_heal")
 
-    await browser.wait_for(f"PASS:{spec}", from_start=True, timeout_ms=60_000)
+    done = await browser.wait_signal("pass", timeout_ms=60_000)
+    assert done is not None and done.payload == spec, f"expected pass for {spec}, got {done}"
     exit_res = await browser.wait_exit(timeout_ms=30_000)
     assert exit_res["exit_code"] == 0, f"{spec}: browser exited with {exit_res}"
     run = await cluster.finish(verdict="passed")
@@ -191,11 +192,7 @@ async def main() -> None:
 
         await c.start()
         try:
-            await db.wait_for("PG_READY", from_start=True, timeout_ms=60_000)
-            await app.wait_for("Ready in", from_start=True, timeout_ms=90_000)
-            await browser.wait_for("READY_LOGGED_IN", from_start=True, timeout_ms=90_000)
-            # Let the runner enter its blocking read on /dev/rewind-console.
-            await c.advance(ms=100)
+            await browser.wait_signal("dispatch", barrier=True, timeout_ms=180_000)
             t_boot = time.perf_counter()
 
             # Snapshot the entire 3-VM stack once while Chromium is already logged in!
@@ -252,21 +249,18 @@ async def main() -> None:
                 restore_times.append(t_restore)
 
                 t_test0 = time.perf_counter()
-                await browser.send_input(f"{spec}\n")
+                await browser.release("dispatch", spec)
 
                 if spec == "db_partition_and_recover":
-                    await browser.wait_for(
-                        "READY_FOR_DB_FAULT", from_start=True, timeout_ms=30_000
-                    )
+                    await browser.wait_signal("db_partition", barrier=True, timeout_ms=30_000)
                     await c.partition(["db"], ["app", "browser"])
-                    await browser.send_input("PARTITIONED\n")
-                    await browser.wait_for(
-                        "DB_FAULT_OBSERVED", from_start=True, timeout_ms=30_000
-                    )
+                    await browser.release("db_partition")
+                    await browser.wait_signal("db_heal", barrier=True, timeout_ms=30_000)
                     await c.heal()
-                    await browser.send_input("HEALED\n")
+                    await browser.release("db_heal")
 
-                await browser.wait_for(f"PASS:{spec}", from_start=True, timeout_ms=60_000)
+                done = await browser.wait_signal("pass", timeout_ms=60_000)
+                assert done is not None and done.payload == spec, done
                 t_test = time.perf_counter() - t_test0
                 print(
                     f"[test] {spec:26s} PASS  (restore={t_restore*1000:6.1f}ms, run={t_test:5.2f}s)",

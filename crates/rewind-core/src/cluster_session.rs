@@ -46,7 +46,7 @@ use crate::inspect::{Inspection, cat_on_machine, list_on_machine};
 use crate::keyframes::{ReadPages, StorePages};
 use crate::run::{Keyframes, SpecExt};
 
-/// Which guest stream `wait_for` or `logs` inspects.
+/// Which guest stream `logs` inspects.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogStream {
     /// Job stdout/stderr captured from trace `Output` events.
@@ -56,7 +56,7 @@ pub enum LogStream {
     Console,
     /// Guest `Mark` events.
     Mark,
-    /// Matches across output, console, and marks.
+    /// Combines output, console, and marks.
     Any,
 }
 
@@ -72,17 +72,14 @@ impl LogStream {
     }
 }
 
-/// Live per-node line buffers and read cursors (snapshot/restore-friendly).
+/// Live per-node line buffers (snapshot/restore-friendly).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct NodeBuffers {
     output_lines: Vec<String>,
     output_partial: String,
-    output_cursor: usize,
     console_lines: Vec<String>,
     console_partial: String,
-    console_cursor: usize,
     mark_lines: Vec<String>,
-    mark_cursor: usize,
 }
 
 impl NodeBuffers {
@@ -123,38 +120,6 @@ impl NodeBuffers {
             }
         }
     }
-
-    /// Searches unread lines (or from start if `from_start`) for `needle`.
-    /// Advances the stream's read cursor past the matched line when found.
-    fn try_match(&mut self, stream: LogStream, needle: &str, from_start: bool) -> Option<String> {
-        match stream {
-            LogStream::Output => match_in(
-                &self.output_lines,
-                &self.output_partial,
-                &mut self.output_cursor,
-                needle,
-                from_start,
-            ),
-            LogStream::Console => match_in(
-                &self.console_lines,
-                &self.console_partial,
-                &mut self.console_cursor,
-                needle,
-                from_start,
-            ),
-            LogStream::Mark => match_in(
-                &self.mark_lines,
-                "",
-                &mut self.mark_cursor,
-                needle,
-                from_start,
-            ),
-            LogStream::Any => self
-                .try_match(LogStream::Output, needle, from_start)
-                .or_else(|| self.try_match(LogStream::Console, needle, from_start))
-                .or_else(|| self.try_match(LogStream::Mark, needle, from_start)),
-        }
-    }
 }
 
 fn push_bytes_as_lines(bytes: &[u8], partial: &mut String, lines: &mut Vec<String>) {
@@ -168,33 +133,6 @@ fn push_bytes_as_lines(bytes: &[u8], partial: &mut String, lines: &mut Vec<Strin
             partial.push(ch);
         }
     }
-}
-
-fn match_in(
-    lines: &[String],
-    partial: &str,
-    cursor: &mut usize,
-    needle: &str,
-    from_start: bool,
-) -> Option<String> {
-    let start = if from_start { 0 } else { *cursor };
-    if start < lines.len() {
-        for (idx, line) in lines[start..].iter().enumerate() {
-            if line.contains(needle) {
-                if !from_start {
-                    *cursor = start + idx + 1;
-                }
-                return Some(line.clone());
-            }
-        }
-    }
-    if !partial.is_empty() && partial.contains(needle) {
-        if !from_start {
-            *cursor = lines.len();
-        }
-        return Some(partial.to_string());
-    }
-    None
 }
 
 /// In-memory session recorder that captures all node trace records, network
@@ -322,96 +260,6 @@ impl ClusterObserver for SessionRecorder {
     }
 }
 
-/// Observer wrapper that stops as soon as `target_node` emits a line containing
-/// `needle` on `stream`.
-struct WaitForObserver<'a> {
-    rec: &'a mut SessionRecorder,
-    target_node: usize,
-    stream: LogStream,
-    needle: &'a str,
-    matched: Option<String>,
-}
-
-impl ClusterObserver for WaitForObserver<'_> {
-    fn node_record(&mut self, node: usize, step: u64, record: &[u8]) {
-        self.rec.record_event(node, step, record);
-        if node == self.target_node
-            && self.matched.is_none()
-            && let Some(line) = self.rec.buffers[node].try_match(self.stream, self.needle, false)
-        {
-            self.matched = Some(line);
-        }
-    }
-
-    fn node_serial(&mut self, node: usize, _step: u64, byte: u8) {
-        self.rec.record_serial(node, byte);
-        if node == self.target_node
-            && self.matched.is_none()
-            && matches!(self.stream, LogStream::Console | LogStream::Any)
-            && let Some(line) = self.rec.buffers[node].try_match(self.stream, self.needle, false)
-        {
-            self.matched = Some(line);
-        }
-    }
-
-    fn net_event(&mut self, event: &NetEvent) {
-        self.rec.record_net(event);
-    }
-
-    fn control_signal(&mut self, signal: &ControlSignal) {
-        self.rec.record_signal(signal);
-    }
-
-    fn stop(&self) -> bool {
-        self.matched.is_some()
-    }
-}
-
-/// Observer wrapper that stops as soon as ANY node in `target_nodes` emits a
-/// line containing `needle` on `stream`.
-struct WaitAnyObserver<'a> {
-    rec: &'a mut SessionRecorder,
-    target_nodes: &'a [usize],
-    stream: LogStream,
-    needle: &'a str,
-    matched: Option<(usize, String)>,
-}
-
-impl ClusterObserver for WaitAnyObserver<'_> {
-    fn node_record(&mut self, node: usize, step: u64, record: &[u8]) {
-        self.rec.record_event(node, step, record);
-        if self.matched.is_none()
-            && self.target_nodes.contains(&node)
-            && let Some(line) = self.rec.buffers[node].try_match(self.stream, self.needle, false)
-        {
-            self.matched = Some((node, line));
-        }
-    }
-
-    fn node_serial(&mut self, node: usize, _step: u64, byte: u8) {
-        self.rec.record_serial(node, byte);
-        if self.matched.is_none()
-            && self.target_nodes.contains(&node)
-            && matches!(self.stream, LogStream::Console | LogStream::Any)
-            && let Some(line) = self.rec.buffers[node].try_match(self.stream, self.needle, false)
-        {
-            self.matched = Some((node, line));
-        }
-    }
-
-    fn net_event(&mut self, event: &NetEvent) {
-        self.rec.record_net(event);
-    }
-
-    fn control_signal(&mut self, signal: &ControlSignal) {
-        self.rec.record_signal(signal);
-    }
-
-    fn stop(&self) -> bool {
-        self.matched.is_some()
-    }
-}
-
 /// Observer wrapper that stops as soon as a matching `http://rewind` signal or
 /// barrier arrives from any allowed node.
 struct WaitSignalObserver<'a> {
@@ -500,7 +348,7 @@ struct SessionSnapshot {
 }
 
 const SAVED_SNAP_MAGIC: &[u8; 8] = b"rwcsnap\0";
-const SAVED_SNAP_VERSION: u32 = 2;
+const SAVED_SNAP_VERSION: u32 = 3;
 
 /// Portable on-disk cluster snapshot metadata referencing content-addressed
 /// guest RAM pages in `home.store()`. Multiple independent worker processes can
@@ -588,27 +436,6 @@ pub struct AdvanceResult {
     pub cluster_step: u64,
     pub stop: String,
     pub nodes: Vec<NodeStatus>,
-}
-
-/// Result of `ClusterSession::wait_for`.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct WaitForResult {
-    pub matched: bool,
-    pub line: Option<String>,
-    pub cluster_ns: u64,
-    pub cluster_step: u64,
-    pub node_step: u64,
-}
-
-/// Result of `ClusterSession::wait_any`.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct WaitAnyResult {
-    pub matched: bool,
-    pub node: Option<String>,
-    pub line: Option<String>,
-    pub cluster_ns: u64,
-    pub cluster_step: u64,
-    pub node_step: u64,
 }
 
 /// One guest signal/barrier event surfaced with its resolved node name.
@@ -1013,71 +840,6 @@ impl ClusterSession {
         })
     }
 
-    /// Waits until `node_name` emits a line containing `needle` on `stream`, or
-    /// until `timeout_ns` virtual time elapses.
-    pub fn wait_for(
-        &mut self,
-        node_name: &str,
-        needle: &str,
-        stream: LogStream,
-        timeout_ns: Option<u64>,
-        from_start: bool,
-        wall_timeout: Option<Duration>,
-    ) -> Result<WaitForResult> {
-        let idx = self.node_index(node_name)?;
-        if let Some(line) = self.recorder.buffers[idx].try_match(stream, needle, from_start) {
-            return Ok(WaitForResult {
-                matched: true,
-                line: Some(line),
-                cluster_ns: self.cluster.cluster_ns(),
-                cluster_step: self.cluster.cluster_step(),
-                node_step: self.cluster.node_steps(idx),
-            });
-        }
-
-        let target_ns = timeout_ns.map(|d| self.cluster.cluster_ns().saturating_add(d));
-        let deadline = wall_timeout.map(|d| Instant::now() + d);
-
-        let matched = loop {
-            let chunk_target = match (target_ns, self.keyframes_mode) {
-                (Some(t), Keyframes::Take) => Some(t.min(self.next_kf_ns)),
-                (Some(t), Keyframes::Skip | Keyframes::AtExit) => Some(t),
-                (None, Keyframes::Take) => Some(self.next_kf_ns),
-                (None, Keyframes::Skip | Keyframes::AtExit) => None,
-            };
-            let mut obs = WaitForObserver {
-                rec: &mut self.recorder,
-                target_node: idx,
-                stream,
-                needle,
-                matched: None,
-            };
-            let out = self.cluster.run(&mut obs, chunk_target, deadline)?;
-            let found = obs.matched.take();
-            self.last_stop = out.stop;
-            if let Some(line) = found {
-                break Some(line);
-            }
-            if out.stop != ClusterStop::Paused {
-                break None;
-            }
-            self.maybe_capture_periodic_keyframe()?;
-            if let Some(t) = target_ns
-                && self.cluster.cluster_ns() >= t
-            {
-                break None;
-            }
-        };
-
-        Ok(WaitForResult {
-            matched: matched.is_some(),
-            line: matched,
-            cluster_ns: self.cluster.cluster_ns(),
-            cluster_step: self.cluster.cluster_step(),
-            node_step: self.cluster.node_steps(idx),
-        })
-    }
-
     /// Waits until `node_name` exits (or until the cluster stop condition is
     /// satisfied when `node_name` is `None`), up to `timeout_ns` virtual time.
     pub fn wait_exit(
@@ -1323,94 +1085,6 @@ impl ClusterSession {
             barrier: sig.barrier,
             conn_id: sig.conn_id,
         }
-    }
-
-    /// Waits until ANY node in `node_names` (or all nodes if empty) emits a line
-    /// containing `needle` on `stream`, or until `timeout_ns` virtual time elapses.
-    pub fn wait_any(
-        &mut self,
-        node_names: &[String],
-        needle: &str,
-        stream: LogStream,
-        timeout_ns: Option<u64>,
-        from_start: bool,
-        wall_timeout: Option<Duration>,
-    ) -> Result<WaitAnyResult> {
-        let target_nodes: Vec<usize> = if node_names.is_empty() {
-            (0..self.node_names.len()).collect()
-        } else {
-            let mut out = Vec::with_capacity(node_names.len());
-            for n in node_names {
-                out.push(self.node_index(n)?);
-            }
-            out
-        };
-
-        for &idx in &target_nodes {
-            if let Some(line) = self.recorder.buffers[idx].try_match(stream, needle, from_start) {
-                return Ok(WaitAnyResult {
-                    matched: true,
-                    node: Some(self.node_names[idx].clone()),
-                    line: Some(line),
-                    cluster_ns: self.cluster.cluster_ns(),
-                    cluster_step: self.cluster.cluster_step(),
-                    node_step: self.cluster.node_steps(idx),
-                });
-            }
-        }
-
-        let target_ns = timeout_ns.map(|d| self.cluster.cluster_ns().saturating_add(d));
-        let deadline = wall_timeout.map(|d| Instant::now() + d);
-
-        let matched = loop {
-            let chunk_target = match (target_ns, self.keyframes_mode) {
-                (Some(t), Keyframes::Take) => Some(t.min(self.next_kf_ns)),
-                (Some(t), Keyframes::Skip | Keyframes::AtExit) => Some(t),
-                (None, Keyframes::Take) => Some(self.next_kf_ns),
-                (None, Keyframes::Skip | Keyframes::AtExit) => None,
-            };
-            let mut obs = WaitAnyObserver {
-                rec: &mut self.recorder,
-                target_nodes: &target_nodes,
-                stream,
-                needle,
-                matched: None,
-            };
-            let out = self.cluster.run(&mut obs, chunk_target, deadline)?;
-            let found = obs.matched.take();
-            self.last_stop = out.stop;
-            if let Some(hit) = found {
-                break Some(hit);
-            }
-            if out.stop != ClusterStop::Paused {
-                break None;
-            }
-            self.maybe_capture_periodic_keyframe()?;
-            if let Some(t) = target_ns
-                && self.cluster.cluster_ns() >= t
-            {
-                break None;
-            }
-        };
-
-        Ok(match matched {
-            Some((idx, line)) => WaitAnyResult {
-                matched: true,
-                node: Some(self.node_names[idx].clone()),
-                line: Some(line),
-                cluster_ns: self.cluster.cluster_ns(),
-                cluster_step: self.cluster.cluster_step(),
-                node_step: self.cluster.node_steps(idx),
-            },
-            None => WaitAnyResult {
-                matched: false,
-                node: None,
-                line: None,
-                cluster_ns: self.cluster.cluster_ns(),
-                cluster_step: self.cluster.cluster_step(),
-                node_step: 0,
-            },
-        })
     }
 
     /// Waits until a guest calls `http://rewind/signal/<name>` or

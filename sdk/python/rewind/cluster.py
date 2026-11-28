@@ -27,8 +27,6 @@ from .types import (
     ClusterError,
     Nemesis,
     SignalEvent,
-    WaitAnyResult,
-    WaitResult,
 )
 
 T = TypeVar("T")
@@ -283,80 +281,6 @@ class Cluster:
         if wall_timeout_ms is not None:
             params["wall_timeout_ms"] = wall_timeout_ms
         return await self._rpc.call("cluster.advance", params)
-
-    async def wait_for(
-        self,
-        node: str,
-        contains: str,
-        *,
-        stream: str = "output",
-        timeout_ms: Optional[int] = 10_000,
-        from_start: bool = False,
-        wall_timeout_ms: Optional[int] = None,
-        check: bool = True,
-    ) -> WaitResult:
-        params: Dict[str, Any] = {
-            "node": node,
-            "contains": contains,
-            "stream": stream,
-            "from_start": from_start,
-        }
-        if timeout_ms is not None:
-            params["timeout_ms"] = timeout_ms
-        if wall_timeout_ms is not None:
-            params["wall_timeout_ms"] = wall_timeout_ms
-        res = await self._rpc.call("cluster.wait_for", params)
-        out = WaitResult(
-            matched=bool(res["matched"]),
-            line=res.get("line"),
-            cluster_ns=int(res["cluster_ns"]),
-            cluster_step=int(res["cluster_step"]),
-            node_step=int(res["node_step"]),
-        )
-        if check and not out.matched:
-            raise AssertionError(
-                f"timed out waiting for {node!r} ({stream}) to emit {contains!r} "
-                f"at {out.cluster_ms:.1f}ms"
-            )
-        return out
-
-    async def wait_any(
-        self,
-        nodes: Sequence[str],
-        contains: str,
-        *,
-        stream: str = "output",
-        timeout_ms: Optional[int] = 10_000,
-        from_start: bool = False,
-        wall_timeout_ms: Optional[int] = None,
-        check: bool = True,
-    ) -> WaitAnyResult:
-        """Waits until any node in ``nodes`` (or any node if empty) emits ``contains``."""
-        params: Dict[str, Any] = {
-            "nodes": list(nodes),
-            "contains": contains,
-            "stream": stream,
-            "from_start": from_start,
-        }
-        if timeout_ms is not None:
-            params["timeout_ms"] = timeout_ms
-        if wall_timeout_ms is not None:
-            params["wall_timeout_ms"] = wall_timeout_ms
-        res = await self._rpc.call("cluster.wait_any", params)
-        out = WaitAnyResult(
-            matched=bool(res["matched"]),
-            node=res.get("node"),
-            line=res.get("line"),
-            cluster_ns=int(res["cluster_ns"]),
-            cluster_step=int(res["cluster_step"]),
-            node_step=int(res["node_step"]),
-        )
-        if check and not out.matched:
-            raise AssertionError(
-                f"timed out waiting for any of {list(nodes)!r} ({stream}) to emit "
-                f"{contains!r} at {out.cluster_ms:.1f}ms"
-            )
-        return out
 
     async def wait_signal(
         self,

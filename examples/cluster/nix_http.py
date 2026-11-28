@@ -30,8 +30,10 @@ async def main() -> None:
         srv = c.add_node(
             "api",
             "echo 'hello-from-nix' > /build/greeting.txt && "
-            "echo 'API_READY' && "
-            "python3 -m http.server 8000 --directory /build",
+            "python3 -m http.server 8000 --directory /build & "
+            "until grep -q ':1F40 ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; do sleep 0.01; done && "
+            "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://rewind/signal/ready\")' && "
+            "wait",
             ip="10.0.0.1",
             role="service",
             packages=["nixpkgs#python3"],
@@ -40,13 +42,16 @@ async def main() -> None:
             "client",
             """
 set -e
-sleep 0.3
-echo "R1=$(curl -sf --max-time 1 http://api:8000/greeting.txt || echo blocked)"
-sleep 0.5
-echo "R2=$(curl -sf --max-time 1 http://api:8000/greeting.txt || echo blocked)"
-sleep 0.5
-echo "R3=$(curl -sf --max-time 1 http://api:8000/greeting.txt || echo blocked)"
-echo "NIX_HTTP_OK"
+curl -sf http://rewind/barrier/start >/dev/null
+r1=$(curl -sf --max-time 1 http://api:8000/greeting.txt || echo blocked)
+curl -sf -X POST -d "$r1" http://rewind/signal/r1 >/dev/null
+curl -sf http://rewind/barrier/r2 >/dev/null
+r2=$(curl -sf --max-time 1 http://api:8000/greeting.txt || echo blocked)
+curl -sf -X POST -d "$r2" http://rewind/signal/r2 >/dev/null
+curl -sf http://rewind/barrier/r3 >/dev/null
+r3=$(curl -sf --max-time 1 http://api:8000/greeting.txt || echo blocked)
+curl -sf -X POST -d "$r3" http://rewind/signal/r3 >/dev/null
+curl -sf -X POST -d "ok" http://rewind/signal/done >/dev/null
 """,
             ip="10.0.0.2",
             role="driver",
@@ -54,21 +59,27 @@ echo "NIX_HTTP_OK"
         )
 
         await c.start()
-        await srv.wait_for("API_READY")
+        await srv.wait_signal("ready")
+        await cli.wait_signal("start", barrier=True)
+        await cli.release("start")
 
-        r1 = await cli.wait_for("R1=")
-        assert r1.line == "R1=hello-from-nix", r1.line
+        r1 = await cli.wait_signal("r1")
+        assert r1 is not None and r1.payload == "hello-from-nix", r1
         assert (await srv.cat("/build/greeting.txt")).strip() == "hello-from-nix"
 
+        await cli.wait_signal("r2", barrier=True)
         await c.partition(["api"], ["client"])
-        r2 = await cli.wait_for("R2=")
-        assert r2.line == "R2=blocked", r2.line
+        await cli.release("r2")
+        r2 = await cli.wait_signal("r2")
+        assert r2 is not None and r2.payload == "blocked", r2
 
+        await cli.wait_signal("r3", barrier=True)
         await c.heal()
-        r3 = await cli.wait_for("R3=")
-        assert r3.line == "R3=hello-from-nix", r3.line
+        await cli.release("r3")
+        r3 = await cli.wait_signal("r3")
+        assert r3 is not None and r3.payload == "hello-from-nix", r3
 
-        await cli.wait_for("NIX_HTTP_OK")
+        await cli.wait_signal("done")
         res = await cli.wait_exit()
         assert res["exited"] and res["exit_code"] == 0, res
         fin = await c.finish()

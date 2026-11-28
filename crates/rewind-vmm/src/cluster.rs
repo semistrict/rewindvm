@@ -50,7 +50,7 @@ pub const DEFAULT_SLICE_NS: u64 = 50_000;
 /// Minimum virtual-time lookahead window (5 ms) above global virtual time for
 /// nodes whose peers are partitioned, idle, or exited. Keeps partitioned nodes
 /// decoupled and parallel while bounding skew at interactive faults and
-/// keeping `wait_for` / `advance` responsive.
+/// keeping `wait_signal` / `advance` responsive.
 const UNCONSTRAINED_WINDOW_NS: u64 = 5_000_000;
 
 /// Maximum VM exits a node executes in a single round slice. Large enough that

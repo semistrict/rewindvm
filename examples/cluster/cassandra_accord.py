@@ -222,24 +222,18 @@ async def main() -> None:
 
         await c.start()
         try:
-            for h in node_handles:
-                await h.wait_for(
-                    "Starting listening for CQL clients",
-                    from_start=True,
-                    timeout_ms=120_000,
-                )
-
-            await client.wait_for("CLUSTER_3_NODES_JOINED", from_start=True, timeout_ms=60_000)
-            await client.wait_for("CLUSTER_READY", from_start=True, timeout_ms=60_000)
+            await client.wait_signal("cluster_3_nodes_joined", timeout_ms=240_000)
+            await client.wait_signal("cluster_ready", barrier=True, timeout_ms=60_000)
             t_boot = time.perf_counter()
 
             # Snapshot the warm 3-node Accord cluster (VMs + full virtual switch)
-            # so we can branch into multiple mid-flight fault timelines without rebooting!
+            # while the driver is parked on `cluster_ready`!
             snap_ready = await c.snapshot("cluster-ready")
             t_snap = time.perf_counter()
 
             # === Branch A: Mid-flight minority partition + lossy/jittery quorum link + heal ===
-            await client.wait_for("STORM_IN_FLIGHT", from_start=True, timeout_ms=60_000)
+            await client.release("cluster_ready")
+            await client.wait_signal("storm_in_flight", timeout_ms=60_000)
             await c.partition(["node3"], ["node1", "node2", "client"])
             await c.set_link(
                 "node1",
@@ -250,7 +244,7 @@ async def main() -> None:
                 duplicate_ppm=20_000,
             )
 
-            await client.wait_for("STORM_MID", from_start=True, timeout_ms=90_000)
+            await client.wait_signal("storm_mid", timeout_ms=90_000)
             await c.heal()
             await c.set_link(
                 "node1",
@@ -261,32 +255,37 @@ async def main() -> None:
                 duplicate_ppm=0,
             )
 
-            conv_a = await client.wait_for("CONVERGENCE", from_start=True, timeout_ms=90_000)
-            assert "nodes=3 " in (conv_a.line or ""), f"Branch A expected 3 converged nodes: {conv_a.line}"
-            await client.wait_for("ACCORD_ALL_OK", from_start=True, timeout_ms=30_000)
+            conv_a = await client.wait_signal("convergence", timeout_ms=90_000)
+            assert conv_a is not None and conv_a.json()["nodes"] == 3, (
+                f"Branch A expected 3 converged nodes: {conv_a}"
+            )
+            await client.wait_signal("accord_all_ok", timeout_ms=30_000)
             t_branch_a = time.perf_counter()
-            print(f"[Branch A] {conv_a.line} ({t_branch_a - t_snap:.2f}s wall)", flush=True)
+            print(f"[Branch A] {conv_a.payload} ({t_branch_a - t_snap:.2f}s wall)", flush=True)
 
             # === Rewind to `cluster-ready` (zero JVM reboot!) ===
             await c.restore(snap_ready)
             t_restore = time.perf_counter()
 
             # === Branch B: Mid-flight asymmetric partition -> hard crash of node3 ===
-            await client.wait_for("STORM_IN_FLIGHT", from_start=True, timeout_ms=60_000)
+            await client.release("cluster_ready")
+            await client.wait_signal("storm_in_flight", timeout_ms=60_000)
             await c.partition(["node1"], ["node2"], symmetric=False)
 
-            await client.wait_for("STORM_MID", from_start=True, timeout_ms=90_000)
+            await client.wait_signal("storm_mid", timeout_ms=90_000)
             await c.heal()
             await node_handles[2].crash()
 
-            conv_b = await client.wait_for("CONVERGENCE", from_start=True, timeout_ms=90_000)
-            assert "nodes=2 " in (conv_b.line or ""), f"Branch B expected 2 surviving nodes: {conv_b.line}"
-            await client.wait_for("ACCORD_ALL_OK", from_start=True, timeout_ms=30_000)
+            conv_b = await client.wait_signal("convergence", timeout_ms=90_000)
+            assert conv_b is not None and conv_b.json()["nodes"] == 2, (
+                f"Branch B expected 2 surviving nodes: {conv_b}"
+            )
+            await client.wait_signal("accord_all_ok", timeout_ms=30_000)
             res = await client.wait_exit(timeout_ms=10_000)
             assert res["exited"] and res["exit_code"] == 0, res
             t_branch_b = time.perf_counter()
             print(
-                f"[Branch B] {conv_b.line} ({t_branch_b - t_restore:.2f}s wall; "
+                f"[Branch B] {conv_b.payload} ({t_branch_b - t_restore:.2f}s wall; "
                 f"restore={t_restore - t_branch_a:.2f}s)",
                 flush=True,
             )

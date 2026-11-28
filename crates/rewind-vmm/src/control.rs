@@ -517,10 +517,15 @@ impl ControlPlane {
             }
             ControlConnState::WaitingBarrier { .. } => {
                 if (flags & TCP_FIN) != 0 {
-                    // Guest closed/aborted its barrier wait (e.g. curl --max-time).
-                    conn.guest_seq = conn.guest_seq.wrapping_add(1);
+                    // Half-close from guest (e.g. `printf ... | nc rewind 80`
+                    // closing stdin via shutdown(SHUT_WR) while still reading
+                    // the HTTP response): ACK the FIN and keep the barrier
+                    // open until `release_barrier` sends the HTTP response.
+                    if seq == conn.guest_seq {
+                        conn.guest_seq = conn.guest_seq.wrapping_add(1);
+                    }
                     self.state.next_ip_id = self.state.next_ip_id.wrapping_add(1);
-                    let fin_ack = build_tcp_frame(
+                    let ack = build_tcp_frame(
                         conn.src_mac,
                         ctrl_ip,
                         src_ip,
@@ -528,14 +533,13 @@ impl ControlPlane {
                         src_port,
                         conn.ctrl_seq,
                         conn.guest_seq,
-                        TCP_FIN | TCP_ACK,
+                        TCP_ACK,
                         65_535,
                         &[],
                         &[],
                         self.state.next_ip_id,
                     );
-                    out.frames.push((now_ns, src_node, fin_ack));
-                    remove_conn = true;
+                    out.frames.push((now_ns, src_node, ack));
                 }
             }
             ControlConnState::Sending { fin_sent } => {
@@ -1173,6 +1177,22 @@ mod tests {
         let (ack_payload, ack_flags, _) = tcp_payload_from_frame(&bar_out.frames[0].2);
         assert!(ack_payload.is_empty());
         assert_eq!(ack_flags, TCP_ACK);
+
+        // Client half-closes write side (`shutdown(SHUT_WR)` like `printf | nc`):
+        // control plane ACKs the FIN without closing the waiting barrier!
+        let fin2 = guest_tcp(
+            guest_mac,
+            guest_ip,
+            ctrl_ip,
+            40001,
+            501 + req2.len() as u32,
+            ctrl_isn2.wrapping_add(1),
+            TCP_FIN | TCP_ACK,
+            &[],
+        );
+        let fin_out = cp.on_frame(5_500, 0, &fin2);
+        let (_, fin_ack_flags, _) = tcp_payload_from_frame(&fin_out.frames[0].2);
+        assert_eq!(fin_ack_flags, TCP_ACK);
 
         // Snapshot while waiting at barrier, then restore & release two branches!
         let snap = cp.snapshot();

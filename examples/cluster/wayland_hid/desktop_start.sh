@@ -92,13 +92,12 @@ echo "CHROME_BIN:$CHROME"
   --user-data-dir=/tmp/chrome-profile \
   "http://10.0.0.2:3000/login" >/tmp/chrome.log 2>&1 &
 CHROME_PID=$!
-echo CHROME_LAUNCHED
+python3 -c 'import urllib.request; urllib.request.urlopen("http://rewind/signal/chrome_launched")'
 
-# Block on /dev/rewind-console until the host finishes sending HID input.
-read -r CMD < /dev/rewind-console || true
-echo "DESKTOP_CMD:$CMD"
+# Block on `http://rewind/barrier/done` until the host finishes sending HID input.
+python3 -c 'import urllib.request; urllib.request.urlopen("http://rewind/barrier/done")'
 
 grep -E "Adding Rewind Paravirtual|libinput" /tmp/labwc.log || true
 
 kill "$CHROME_PID" "$LABWC_PID" "$SEATD_PID" 2>/dev/null || true
-echo HID_DEMO_DONE
+python3 -c 'import urllib.request; urllib.request.urlopen("http://rewind/signal/hid_done")'

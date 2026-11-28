@@ -359,64 +359,6 @@ fn dispatch(
             let s = require_session(session)?;
             Ok(serde_json::to_value(s.advance(delta_ns, until_ns, wall)?)?)
         }
-        "cluster.wait_for" => {
-            #[derive(Deserialize)]
-            struct P {
-                node: String,
-                contains: String,
-                stream: Option<String>,
-                timeout_ms: Option<u64>,
-                #[serde(default)]
-                from_start: bool,
-                wall_timeout_ms: Option<u64>,
-            }
-            let p: P = serde_json::from_value(params).context("invalid params for cluster.wait_for")?;
-            let stream = match p.stream.as_deref() {
-                Some(st) => LogStream::parse(st)?,
-                None => LogStream::Output,
-            };
-            let timeout_ns = p.timeout_ms.map(|m| m.saturating_mul(1_000_000));
-            let wall = p.wall_timeout_ms.map(Duration::from_millis);
-            let s = require_session(session)?;
-            Ok(serde_json::to_value(s.wait_for(
-                &p.node,
-                &p.contains,
-                stream,
-                timeout_ns,
-                p.from_start,
-                wall,
-            )?)?)
-        }
-        "cluster.wait_any" => {
-            #[derive(Deserialize)]
-            struct P {
-                #[serde(default)]
-                nodes: Vec<String>,
-                contains: String,
-                stream: Option<String>,
-                timeout_ms: Option<u64>,
-                #[serde(default)]
-                from_start: bool,
-                wall_timeout_ms: Option<u64>,
-            }
-            let p: P =
-                serde_json::from_value(params).context("invalid params for cluster.wait_any")?;
-            let stream = match p.stream.as_deref() {
-                Some(st) => LogStream::parse(st)?,
-                None => LogStream::Output,
-            };
-            let timeout_ns = p.timeout_ms.map(|m| m.saturating_mul(1_000_000));
-            let wall = p.wall_timeout_ms.map(Duration::from_millis);
-            let s = require_session(session)?;
-            Ok(serde_json::to_value(s.wait_any(
-                &p.nodes,
-                &p.contains,
-                stream,
-                timeout_ns,
-                p.from_start,
-                wall,
-            )?)?)
-        }
         "cluster.wait_signal" => {
             #[derive(Deserialize, Default)]
             struct P {

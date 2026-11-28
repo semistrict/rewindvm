@@ -42,8 +42,6 @@ from .types import (
     ClusterError,
     Nemesis,
     SignalEvent,
-    WaitAnyResult,
-    WaitResult,
 )
 
 __all__ = [
@@ -52,8 +50,6 @@ __all__ = [
     "Nemesis",
     "NodeHandle",
     "SignalEvent",
-    "WaitAnyResult",
-    "WaitResult",
     "guest",
     "EV_SYN",
     "EV_KEY",

@@ -257,12 +257,33 @@ def run_with_retry(fn, attempts: int = 10, delay: float = 0.5):
     raise RuntimeError(f"operation failed after {attempts} attempts: {last_err}")
 
 
+def rewind_signal(name: str, payload: str = "") -> None:
+    import urllib.request
+
+    data = payload.encode("utf-8")
+    req = urllib.request.Request(
+        f"http://rewind/signal/{name}",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json" if payload.startswith("{") else "text/plain"},
+    )
+    with urllib.request.urlopen(req, timeout=30.0):
+        pass
+
+
+def rewind_barrier(name: str) -> str:
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://rewind/barrier/{name}", timeout=120.0) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
 def main() -> None:
     deadline = time.monotonic() + 240.0
     print("DRIVER_CONNECTING", flush=True)
     conns = [connect_with_retry(ip, deadline) for ip in NODES]
     wait_cluster_ready(conns, deadline)
-    print("CLUSTER_3_NODES_JOINED", flush=True)
+    rewind_signal("cluster_3_nodes_joined")
 
     c1, c2, c3 = conns
     c1.query(
@@ -298,9 +319,8 @@ def main() -> None:
     for c in conns:
         c.close()
 
-    # Signal the host orchestrator to snapshot the warm 3-node Accord cluster.
-    print("CLUSTER_READY", flush=True)
-    time.sleep(0.1)
+    # Park at barrier so the host snapshots the warm 3-node Accord cluster cleanly.
+    rewind_barrier("cluster_ready")
 
     # Concurrent conflicting multi-partition Accord storm:
     # 3 workers targeting node1, node2, node3 simultaneously + 1 linearizable auditor.
@@ -355,10 +375,10 @@ def main() -> None:
                     cur = committed_count
                     if cur >= 3 and not in_flight_emitted:
                         in_flight_emitted = True
-                        print(f"STORM_IN_FLIGHT committed={cur}", flush=True)
+                        rewind_signal("storm_in_flight", str(cur))
                     if cur >= 15 and not mid_emitted:
                         mid_emitted = True
-                        print(f"STORM_MID committed={cur}", flush=True)
+                        rewind_signal("storm_mid", str(cur))
         except BaseException as e:
             with lock:
                 errors.append(e)
@@ -434,12 +454,20 @@ def main() -> None:
     assert ledger_count == TXS_PER_WORKER * 3, (
         f"expected {TXS_PER_WORKER * 3} applied txns in txlog, got {ledger_count}"
     )
-    print(
-        f"CONVERGENCE nodes={len(observed)} applied={ledger_count} "
-        f"audits={audit_count} balances={vals[0]}",
-        flush=True,
+    import json
+
+    rewind_signal(
+        "convergence",
+        json.dumps(
+            {
+                "nodes": len(observed),
+                "applied": ledger_count,
+                "audits": audit_count,
+                "balances": vals[0],
+            }
+        ),
     )
-    print("ACCORD_ALL_OK", flush=True)
+    rewind_signal("accord_all_ok")
 
 
 if __name__ == "__main__":
