@@ -77,6 +77,9 @@ fn node_spec(name: &str, ip: &str, role: &str, cmd: &str, skew_ms: i64, drift_pp
         clock_skew_ms: skew_ms,
         clock_drift_ppm: drift_ppm,
         role: Some(role.into()),
+        display: false,
+        display_width: None,
+        display_height: None,
         files: Vec::new(),
     }
 }

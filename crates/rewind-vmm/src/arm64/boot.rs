@@ -30,6 +30,7 @@ pub struct BootSpec<'a> {
     pub seed: [u8; 32],
     pub pmem_len: u64,
     pub extras_len: u64,
+    pub fb: Option<crate::FramebufferConfig>,
 }
 
 /// Entry addresses produced by [`load`].
@@ -82,16 +83,25 @@ pub fn load(ram: &mut Mapping, spec: &BootSpec<'_>) -> Result<BootAddresses> {
         .checked_add(effective_size)
         .ok_or_else(|| anyhow::anyhow!("kernel size overflow"))?;
     let ram_len = ram.len() as u64;
-    if kernel_end > ram_len {
-        bail!("kernel ({effective_size} bytes) does not fit in {ram_len} bytes of RAM");
+    let (usable_ram_len, framebuffer) = if let Some(fb) = spec.fb {
+        let (info, fb_off, alloc_size) = crate::framebuffer_layout(RAM_BASE, ram_len, fb)?;
+        (
+            fb_off,
+            Some((info.addr, alloc_size, info.width, info.height, info.stride)),
+        )
+    } else {
+        (ram_len, None)
+    };
+    if kernel_end > usable_ram_len {
+        bail!("kernel ({effective_size} bytes) does not fit in {usable_ram_len} bytes of RAM");
     }
     ram.write(kernel_offset, spec.kernel)?;
     let kernel_entry = RAM_BASE + kernel_offset;
 
-    // Place initrd near the top of RAM, 16 KiB aligned.
+    // Place initrd near the top of usable RAM (below any reserved framebuffer), 16 KiB aligned.
     let initrd_len = spec.initrd.len() as u64;
     let initrd_offset = if initrd_len > 0 {
-        let aligned = ram_len
+        let aligned = usable_ram_len
             .checked_sub(initrd_len)
             .ok_or_else(|| anyhow::anyhow!("initrd does not fit in RAM"))?
             & !(HOST_PAGE_SIZE as u64 - 1);
@@ -101,7 +111,7 @@ pub fn load(ram: &mut Mapping, spec: &BootSpec<'_>) -> Result<BootAddresses> {
         ram.write(aligned, spec.initrd)?;
         aligned
     } else {
-        ram_len
+        usable_ram_len
     };
     let initrd_start = RAM_BASE + initrd_offset;
     let initrd_end = initrd_start + initrd_len;
@@ -111,13 +121,14 @@ pub fn load(ram: &mut Mapping, spec: &BootSpec<'_>) -> Result<BootAddresses> {
 
     let dtb = fdt::build(&FdtConfig {
         ram_base: RAM_BASE,
-        ram_size: ram_len,
+        ram_size: usable_ram_len,
         cmdline: spec.cmdline,
         initrd_start,
         initrd_end,
         seed: spec.seed,
         pmem,
         extras,
+        framebuffer,
     });
 
     // Place the DTB directly below the initrd, aligned to FDT_ALIGN.

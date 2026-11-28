@@ -220,6 +220,31 @@ const _: () = assert!(SHARED_NET_ENABLED == 3292);
 const _: () = assert!(SHARED_NET_RX_RING.is_multiple_of(8));
 const _: () = assert!(SHARED_NET_MAC + 8 <= crate::layout::PAGE_SIZE as u64);
 
+/// Paravirtual framebuffer (`/dev/fb0`) for deterministic desktop screencasts:
+/// - The monitor sets `fb_enabled = 1` (and optional requested `fb_width` /
+///   `fb_height`) during `PORT_SETUP`.
+/// - The guest allocates contiguous guest RAM (`XRGB8888`, 32 bpp) and
+///   publishes `fb_width`, `fb_height`, `fb_stride`, `fb_size`, and finally
+///   `fb_addr` (physical address).
+pub const SHARED_FB_ENABLED: u64 = SHARED_NET_MAC + 8;
+pub const SHARED_FB_ADDR: u64 = SHARED_FB_ENABLED + 4;
+pub const SHARED_FB_WIDTH: u64 = SHARED_FB_ADDR + 8;
+pub const SHARED_FB_HEIGHT: u64 = SHARED_FB_WIDTH + 4;
+pub const SHARED_FB_STRIDE: u64 = SHARED_FB_HEIGHT + 4;
+pub const SHARED_FB_SIZE: u64 = SHARED_FB_STRIDE + 4;
+
+/// Default framebuffer dimensions (720p, 32 bpp XRGB8888 = 3.52 MiB <= 4 MiB).
+pub const FB_DEFAULT_WIDTH: u32 = 1280;
+pub const FB_DEFAULT_HEIGHT: u32 = 720;
+/// Upper bound on framebuffer byte size accepted from guest RAM (4 MiB).
+pub const FB_SIZE_MAX: u32 = 4 * 1024 * 1024;
+
+const _: () = assert!(SHARED_FB_ENABLED == 3324);
+const _: () = assert!(SHARED_FB_ADDR == 3328 && SHARED_FB_ADDR.is_multiple_of(8));
+const _: () = assert!(SHARED_FB_WIDTH == 3336);
+const _: () = assert!(SHARED_FB_SIZE == 3348);
+const _: () = assert!(SHARED_FB_SIZE + 4 <= crate::layout::PAGE_SIZE as u64);
+
 /// Whether a guest kernel that names interface `version` is one this
 /// monitor runs: its own, and no other.
 pub fn check_interface(version: u32) -> anyhow::Result<()> {

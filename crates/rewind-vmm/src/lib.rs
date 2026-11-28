@@ -190,6 +190,76 @@ fn recorded_slot_fits(bits: u32) -> Result<()> {
     )
 }
 
+/// Paravirtual framebuffer (`/dev/fb0`) configuration for deterministic
+/// desktop screencasts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FramebufferConfig {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for FramebufferConfig {
+    fn default() -> FramebufferConfig {
+        FramebufferConfig {
+            width: pv::FB_DEFAULT_WIDTH,
+            height: pv::FB_DEFAULT_HEIGHT,
+        }
+    }
+}
+
+/// Geometry and guest physical address of an active paravirtual framebuffer
+/// published by the guest kernel (`XRGB8888`, 32 bpp little-endian = `bgr0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FramebufferInfo {
+    pub addr: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub size: u32,
+}
+
+/// Computes the deterministic reserved top-of-RAM layout for a paravirtual
+/// `simple-framebuffer` region: `(FramebufferInfo, ram_offset, alloc_size)`.
+pub(crate) fn framebuffer_layout(
+    ram_base: u64,
+    ram_len: u64,
+    fb: FramebufferConfig,
+) -> Result<(FramebufferInfo, u64, u64)> {
+    let width = fb.width.clamp(64, 1920);
+    let height = fb.height.clamp(64, 1080);
+    let stride = width
+        .checked_mul(4)
+        .context("framebuffer stride overflow")?;
+    let size = stride
+        .checked_mul(height)
+        .context("framebuffer byte size overflow")?;
+    let alloc_size = (size as u64).next_multiple_of(2 << 20);
+    if alloc_size > pv::FB_SIZE_MAX as u64 {
+        bail!(
+            "framebuffer {width}x{height} ({alloc_size} bytes) exceeds {} MiB limit",
+            pv::FB_SIZE_MAX >> 20
+        );
+    }
+    let fb_offset = ram_len
+        .checked_sub(alloc_size)
+        .filter(|&off| off >= 32 << 20)
+        .with_context(|| {
+            format!(
+                "guest RAM ({} MiB) is too small to reserve {} MiB framebuffer",
+                ram_len >> 20,
+                alloc_size >> 20
+            )
+        })?;
+    let info = FramebufferInfo {
+        addr: ram_base + fb_offset,
+        width,
+        height,
+        stride,
+        size,
+    };
+    Ok((info, fb_offset, alloc_size))
+}
+
 /// Everything that determines a run. Two machines built from equal configs
 /// run identically.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -216,6 +286,9 @@ pub struct Config {
     pub extras: Extras,
     /// Optional paravirtual Ethernet NIC for multi-node cluster runs.
     pub net: Option<NetDeviceConfig>,
+    /// Optional paravirtual framebuffer (`/dev/fb0`) for deterministic video capture.
+    #[serde(default)]
+    pub fb: Option<FramebufferConfig>,
 }
 
 /// Whether KVM logs the pages the guest writes, which keyframes and
@@ -446,6 +519,8 @@ pub(crate) struct Devices {
     pub(crate) event_buffer: Vec<u8>,
     /// Paravirtual Ethernet NIC configuration, if attached.
     pub net_config: Option<NetDeviceConfig>,
+    /// Paravirtual framebuffer geometry + guest physical address, if attached.
+    pub fb_region: Option<FramebufferInfo>,
     /// Guest physical address of `rewind_net_rx` (published at setup).
     pub net_rx_ring: Option<u64>,
     /// Slot count of `rewind_net_rx` (published at setup).
@@ -647,6 +722,13 @@ impl Machine {
         vcpu.set_cpuid2(&cpuid)?;
         cpu::setup_capability_msrs(&kvm, &vcpu, cpuid.as_slice())?;
         let immediate_exit = std::ptr::addr_of_mut!(vcpu.get_kvm_run().immediate_exit);
+        let fb_region = config
+            .fb
+            .map(|fb| {
+                let low = (ram.len() as u64).min(RAM_MAX);
+                framebuffer_layout(RAM_BASE, low, fb).map(|(info, _, _)| info)
+            })
+            .transpose()?;
 
         Ok(Machine {
             kvm,
@@ -672,6 +754,7 @@ impl Machine {
                 event_pending: false,
                 event_buffer: Vec::new(),
                 net_config: config.net,
+                fb_region,
                 net_rx_ring: None,
                 net_rx_slots: 0,
                 tx_queue: std::collections::VecDeque::new(),
@@ -732,6 +815,7 @@ impl Machine {
             seed: self.config.seed,
             pmem_len: self.pmem.as_ref().map_or(0, |p| p.len() as u64),
             extras_len: self.extras.as_ref().map_or(0, |e| e.len() as u64),
+            fb: self.config.fb,
         };
         let write = |ram: &mut Mapping| -> Result<u64> {
             let entry = boot::load(ram, &spec)?;
@@ -950,6 +1034,44 @@ impl Machine {
         self.dev.net_rx_pending = !self.inject(pv::PENDING_NET)?;
         self.dev.idle = false;
         Ok(true)
+    }
+
+    /// Reads the current paravirtual framebuffer (`XRGB8888`, `bgr0` byte order)
+    /// directly from guest RAM, if the guest has initialized `/dev/fb0`.
+    pub fn read_framebuffer(&self) -> Result<Option<(FramebufferInfo, Vec<u8>)>> {
+        self.dev.read_framebuffer()
+    }
+
+    /// Immediately injects `data` into the guest's `/dev/rewind-console`
+    /// buffer and wakes the node if it is idle (used by interactive clusters
+    /// to dispatch deterministic commands into a running or restored guest).
+    pub fn send_console_input(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > pv::INPUT_MAX {
+            bail!(
+                "console input of {} bytes exceeds limit of {} bytes",
+                data.len(),
+                pv::INPUT_MAX
+            );
+        }
+        let shared = self
+            .dev
+            .shared
+            .context("the VM has not finished booting; cannot send console input")?;
+        let mut len = [0u8; 4];
+        self.dev.ram.read(shared + pv::SHARED_INPUT_LEN, &mut len)?;
+        if u32::from_le_bytes(len) != 0 {
+            bail!("previous console input has not been drained by the guest yet");
+        }
+        self.dev.ram.write(shared + pv::SHARED_INPUT, data)?;
+        self.dev
+            .ram
+            .write(shared + pv::SHARED_INPUT_LEN, &(data.len() as u32).to_le_bytes())?;
+        let _ = self.inject(pv::PENDING_INPUT)?;
+        self.dev.idle = false;
+        Ok(())
     }
 
     /// Advances an idle cluster node's local clock to `target_local_ns`,
@@ -1541,6 +1663,18 @@ impl Machine {
 }
 
 impl Devices {
+    /// Reads the current paravirtual framebuffer (`XRGB8888`, `bgr0` byte order)
+    /// directly from reserved guest RAM, returning `Ok(None)` if display is
+    /// disabled on this VM.
+    pub(crate) fn read_framebuffer(&self) -> Result<Option<(FramebufferInfo, Vec<u8>)>> {
+        let Some(info) = self.fb_region else {
+            return Ok(None);
+        };
+        let mut pixels = vec![0u8; info.size as usize];
+        self.ram_read(info.addr, &mut pixels)?;
+        Ok(Some((info, pixels)))
+    }
+
     /// Reads guest RAM at guest physical address `gpa`.
     pub(crate) fn ram_read(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
         let Some(off) = gpa.checked_sub(RAM_BASE) else {
@@ -1695,6 +1829,16 @@ impl Devices {
                     self.net_rx_slots = slots;
                 } else {
                     self.ram_write(shared + pv::SHARED_NET_ENABLED, &0u32.to_le_bytes())?;
+                }
+                if let Some(fb) = self.fb_region {
+                    self.ram_write(shared + pv::SHARED_FB_ADDR, &fb.addr.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_FB_WIDTH, &fb.width.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_FB_HEIGHT, &fb.height.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_FB_STRIDE, &fb.stride.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_FB_SIZE, &fb.size.to_le_bytes())?;
+                    self.ram_write(shared + pv::SHARED_FB_ENABLED, &1u32.to_le_bytes())?;
+                } else {
+                    self.ram_write(shared + pv::SHARED_FB_ENABLED, &0u32.to_le_bytes())?;
                 }
                 self.shared = Some(shared);
                 self.io = Some(rewind_trace::io_records::Encoder::new());
@@ -1999,6 +2143,7 @@ mod tests {
             event_pending: false,
             event_buffer: Vec::new(),
             net_config: None,
+            fb_region: None,
             net_rx_ring: None,
             net_rx_slots: 0,
             tx_queue: std::collections::VecDeque::new(),
@@ -2323,6 +2468,30 @@ mod tests {
     }
 
     #[test]
+    fn framebuffer_layout_reserves_top_of_ram_and_enforces_limit() {
+        let (info, off, alloc) =
+            framebuffer_layout(0x4000_0000, 256 << 20, FramebufferConfig::default()).unwrap();
+        assert_eq!(info.width, 1280);
+        assert_eq!(info.height, 720);
+        assert_eq!(info.stride, 1280 * 4);
+        assert_eq!(info.size, 1280 * 720 * 4);
+        assert_eq!(alloc, 4 << 20);
+        assert_eq!(off, (256 - 4) << 20);
+        assert_eq!(info.addr, 0x4000_0000 + off);
+
+        let err = framebuffer_layout(
+            0x4000_0000,
+            256 << 20,
+            FramebufferConfig {
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
     fn a_kernel_without_records_is_not_drained() {
         // A guest kernel of the interface before records: whatever its
         // shared page holds past the reseed bytes is not a buffer, and the
@@ -2420,6 +2589,7 @@ mod machine_tests {
             preemption: Preemption::AtExits,
             extras: Extras::Absent,
             net: None,
+            fb: None,
         }
     }
 

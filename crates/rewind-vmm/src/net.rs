@@ -83,6 +83,9 @@ pub enum FaultKind {
     Crash { node: usize },
     /// Cold reboot of a previously crashed `node`.
     Restart { node: usize },
+    /// Injects deterministic console input bytes into `node`'s
+    /// `/dev/rewind-console` device.
+    SendInput { node: usize, data: Vec<u8> },
 }
 
 /// Schedule-seed-driven nemesis configuration for `rewind cluster check`.
@@ -244,10 +247,11 @@ pub enum NetEvent {
 }
 
 /// Action the switch instructs the cluster coordinator to perform on a VM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FaultAction {
     Crash(usize),
     Restart(usize),
+    SendInput(usize, Vec<u8>),
 }
 
 /// Cumulative switch counters.
@@ -976,6 +980,14 @@ impl NetSwitch {
                 if *node < self.config.node_count && self.crashed.remove(node) {
                     self.stats.restarts += 1;
                     actions.push(FaultAction::Restart(*node));
+                }
+            }
+            FaultKind::SendInput { node, data } => {
+                if *node < self.config.node_count
+                    && !self.crashed.contains(node)
+                    && !data.is_empty()
+                {
+                    actions.push(FaultAction::SendInput(*node, data.clone()));
                 }
             }
         }

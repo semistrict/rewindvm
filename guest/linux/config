@@ -95,11 +95,14 @@ CONFIG_PREEMPT_LAZY=y
 CONFIG_CMDLINE_BOOL=y
 CONFIG_CMDLINE="sysctl.vm.compaction_proactiveness=0 sysctl.vm.overcommit_memory=1"
 
-# No display, no sound, no USB. The virtual terminal and input layers stay:
-# they are only optional under CONFIG_EXPERT, and with no keyboard and no
-# i8042 they do nothing.
-# CONFIG_DRM is not set
-# CONFIG_FB is not set
+# Paravirtual DRM/KMS framebuffer (/dev/dri/card0 + /dev/fb0) via mainline
+# simpledrm (supports both Wayland compositors and fbdev/X11 clients).
+# Kernel console stays on rewind_console (no framebuffer console).
+CONFIG_DRM=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FB_DEVICE=y
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
 # CONFIG_SOUND is not set
 # CONFIG_USB_SUPPORT is not set
 

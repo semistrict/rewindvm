@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rewind_core::cluster::{
-    ClusterRun, ClusterRunOptions, format_net_event, node_index_map, parse_spec_file,
-    prepare_cluster,
+    ClusterRun, ClusterRunOptions, VideoExportOptions, format_net_event, node_index_map,
+    parse_spec_file, prepare_cluster,
 };
 use rewind_core::cluster_rpc::{ServeDefaults, serve_stream, serve_unix_socket};
 use rewind_core::{Guest, Home, Keyframes};
@@ -50,6 +50,8 @@ pub(crate) enum ClusterAction {
     Net(ClusterNetArgs),
     /// Reconstruct a full Ethernet `.pcap` capture (for Wireshark/tshark) by replaying a cluster run.
     Pcap(ClusterPcapArgs),
+    /// Render a deterministic desktop screencast (`.mp4`, `.webm`, `.gif`, `.png`, or `.raw`) from a node's `/dev/fb0` by replaying a cluster run.
+    Video(ClusterVideoArgs),
     /// Remove recorded cluster runs.
     Remove(ClusterRemoveArgs),
     /// Internal per-node HVF worker process (spawned automatically on macOS).
@@ -255,6 +257,30 @@ pub(crate) struct ClusterPcapArgs {
 }
 
 #[derive(clap::Args)]
+pub(crate) struct ClusterVideoArgs {
+    /// Cluster run id, prefix, name, or `@N`.
+    pub(crate) cluster: String,
+    /// Node whose `/dev/fb0` framebuffer to record.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) node: String,
+    /// Output video or image path (`.mp4`, `.webm`, `.gif`, `.png`, or `.raw`).
+    #[arg(short, long, value_name = "PATH")]
+    pub(crate) output: PathBuf,
+    /// Virtual frames per second to sample (default 30).
+    #[arg(long, default_value_t = 30)]
+    pub(crate) fps: u32,
+    /// Start of virtual-time window in ms (fast-forwards via nearest keyframe).
+    #[arg(long = "from-ms")]
+    pub(crate) from_ms: Option<u64>,
+    /// End of virtual-time window in ms.
+    #[arg(long = "to-ms")]
+    pub(crate) to_ms: Option<u64>,
+    /// Burn the virtual timestamp (`VT mm:ss.mmm`) into the top-right corner.
+    #[arg(long)]
+    pub(crate) timestamp: bool,
+}
+
+#[derive(clap::Args)]
 pub(crate) struct ClusterRemoveArgs {
     /// Cluster run ids, prefixes, names, or `@N`.
     #[arg(required = true)]
@@ -271,6 +297,7 @@ impl ClusterArgs {
                 | ClusterAction::Replay(_)
                 | ClusterAction::Fork(_)
                 | ClusterAction::Pcap(_)
+                | ClusterAction::Video(_)
         )
     }
 }
@@ -286,6 +313,7 @@ pub(crate) fn dispatch(home: &Home, args: ClusterArgs) -> Result<ExitCode> {
         ClusterAction::Show(a) => cmd_show(home, a),
         ClusterAction::Net(a) => cmd_net(home, a),
         ClusterAction::Pcap(a) => cmd_pcap(home, a),
+        ClusterAction::Video(a) => cmd_video(home, a),
         ClusterAction::Remove(a) => cmd_remove(home, a),
         ClusterAction::Worker => {
             rewind_vmm::cluster::run_process_worker_stdio()?;
@@ -930,6 +958,30 @@ fn cmd_pcap(home: &Home, args: ClusterPcapArgs) -> Result<ExitCode> {
             stats.to_ns as f64 / 1_000_000.0,
         );
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_video(home: &Home, args: ClusterVideoArgs) -> Result<ExitCode> {
+    rewind_vmm::kvm::open()?;
+    let run = ClusterRun::find(home, &args.cluster)?;
+    let opts = VideoExportOptions {
+        fps: args.fps,
+        from_ms: args.from_ms,
+        to_ms: args.to_ms,
+        timestamp_overlay: args.timestamp,
+    };
+    let stats = run.export_video(home, &args.node, &args.output, &opts)?;
+    eprintln!(
+        "wrote {} ({}x{}, {} frames @ {} fps, {} non-blank, {:.3}ms..{:.3}ms)",
+        args.output.display(),
+        stats.width,
+        stats.height,
+        stats.frames,
+        stats.fps,
+        stats.non_blank_frames,
+        stats.from_ns as f64 / 1_000_000.0,
+        stats.to_ns as f64 / 1_000_000.0,
+    );
     Ok(ExitCode::SUCCESS)
 }
 

@@ -960,6 +960,13 @@ impl ClusterSession {
         Ok(self.cluster.node_boot_count(idx))
     }
 
+    /// Sends deterministic console input bytes to `node`'s `/dev/rewind-console`
+    /// device, recorded in the cluster trace for bit-for-bit replay.
+    pub fn send_input(&mut self, node: &str, data: Vec<u8>) -> Result<()> {
+        let idx = self.node_index(node)?;
+        self.apply_interactive_fault(FaultKind::SendInput { node: idx, data })
+    }
+
     /// Reads captured lines for `node` on `stream` starting at `since`.
     pub fn logs(&self, node: &str, stream: LogStream, since: usize) -> Result<(Vec<String>, usize)> {
         let idx = self.node_index(node)?;

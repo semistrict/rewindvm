@@ -533,6 +533,10 @@ enum WorkerReq {
     AdvanceIdleTo {
         target_local: u64,
     },
+    SendInput {
+        data: Vec<u8>,
+    },
+    ReadFramebuffer,
     KeyframeDirect {
         parent: Option<u64>,
         store_path: PathBuf,
@@ -551,6 +555,8 @@ enum WorkerReq {
     Shutdown,
 }
 
+type FramebufferFrame = (crate::FramebufferInfo, Vec<u8>);
+
 enum WorkerResp {
     Meta(Result<NodeMeta>),
     RestoredInPlace(Result<(NodeMeta, bool, usize)>),
@@ -560,6 +566,7 @@ enum WorkerResp {
     PreparedKeyframe(Box<Result<Option<PreparedKeyframe>>>),
     NonDestructive(Box<Result<(Keyframe, MemPages, NodeEncoders)>>),
     Encoders(Box<NodeEncoders>),
+    Framebuffer(Box<Result<Option<FramebufferFrame>>>),
     Unit,
     #[cfg(not(target_os = "macos"))]
     Machine(Option<Box<Machine>>),
@@ -766,6 +773,22 @@ fn worker_loop(
                 };
                 WorkerResp::Meta(res)
             }
+            WorkerReq::SendInput { data } => {
+                let res = match machine.as_mut() {
+                    Some(m) => m
+                        .send_console_input(&data)
+                        .map(|()| NodeMeta::from_machine(m)),
+                    None => Err(anyhow!("worker has no live Machine for SendInput")),
+                };
+                WorkerResp::Meta(res)
+            }
+            WorkerReq::ReadFramebuffer => {
+                let res = match machine.as_ref() {
+                    Some(m) => m.read_framebuffer(),
+                    None => Ok(None),
+                };
+                WorkerResp::Framebuffer(Box::new(res))
+            }
             WorkerReq::KeyframeDirect { parent, store_path } => {
                 let res = match machine.as_mut() {
                     Some(m) => store_cache.open(&store_path).and_then(|store| {
@@ -895,6 +918,10 @@ mod proc_worker {
         AdvanceIdleTo {
             target_local: u64,
         },
+        SendInput {
+            data: Vec<u8>,
+        },
+        ReadFramebuffer,
         KeyframeDirect {
             parent: Option<u64>,
             store_path: PathBuf,
@@ -921,6 +948,7 @@ mod proc_worker {
         PreparedKeyframe(Box<std::result::Result<Option<PreparedKeyframe>, String>>),
         NonDestructive(Box<std::result::Result<(Keyframe, MemPages, NodeEncoders), String>>),
         Encoders(Box<NodeEncoders>),
+        Framebuffer(Box<std::result::Result<Option<FramebufferFrame>, String>>),
         Unit,
         Crashed(u64),
     }
@@ -1013,6 +1041,9 @@ mod proc_worker {
                                 WorkerResp::NonDestructive(Box::new((*r).map_err(|e| anyhow!(e))))
                             }
                             WireResp::Encoders(e) => WorkerResp::Encoders(e),
+                            WireResp::Framebuffer(r) => {
+                                WorkerResp::Framebuffer(Box::new((*r).map_err(|e| anyhow!(e))))
+                            }
                             WireResp::Unit => WorkerResp::Unit,
                             WireResp::Crashed(s) => WorkerResp::Crashed(s),
                         };
@@ -1092,6 +1123,8 @@ mod proc_worker {
                 WorkerReq::AdvanceIdleTo { target_local } => {
                     WireReq::AdvanceIdleTo { target_local }
                 }
+                WorkerReq::SendInput { data } => WireReq::SendInput { data },
+                WorkerReq::ReadFramebuffer => WireReq::ReadFramebuffer,
                 WorkerReq::KeyframeDirect { parent, store_path } => {
                     WireReq::KeyframeDirect { parent, store_path }
                 }
@@ -1307,6 +1340,22 @@ mod proc_worker {
                         None => Err(anyhow!("worker has no live Machine for AdvanceIdleTo")),
                     };
                     WireResp::Meta(res.map_err(|e| format!("{e:#}")))
+                }
+                WireReq::SendInput { data } => {
+                    let res = match machine.as_mut() {
+                        Some(m) => m
+                            .send_console_input(&data)
+                            .map(|()| NodeMeta::from_machine(m)),
+                        None => Err(anyhow!("worker has no live Machine for SendInput")),
+                    };
+                    WireResp::Meta(res.map_err(|e| format!("{e:#}")))
+                }
+                WireReq::ReadFramebuffer => {
+                    let res = match machine.as_ref() {
+                        Some(m) => m.read_framebuffer(),
+                        None => Ok(None),
+                    };
+                    WireResp::Framebuffer(Box::new(res.map_err(|e| format!("{e:#}"))))
                 }
                 WireReq::KeyframeDirect { parent, store_path } => {
                     let res = match machine.as_mut() {
@@ -1552,6 +1601,34 @@ impl LiveNode {
                         Ok(ok)
                     }
                     _ => bail!("unexpected response to DeliverRx from node {}", self.cfg.name),
+                }
+            }
+        }
+    }
+
+    fn send_input(&mut self, data: Vec<u8>) -> Result<()> {
+        match &mut self.backend {
+            NodeBackend::Local(opt) => {
+                if let Some(m) = opt.as_mut() {
+                    m.send_console_input(&data)?;
+                    self.meta = Some(NodeMeta::from_machine(m));
+                }
+                Ok(())
+            }
+            NodeBackend::Worker(w) => {
+                if self.meta.is_none() {
+                    return Ok(());
+                }
+                w.send(WorkerReq::SendInput { data })?;
+                match w.recv()? {
+                    WorkerResp::Meta(res) => {
+                        self.meta = Some(res?);
+                        Ok(())
+                    }
+                    _ => bail!(
+                        "unexpected response to SendInput from node {}",
+                        self.cfg.name
+                    ),
                 }
             }
         }
@@ -2573,6 +2650,37 @@ impl Cluster {
         Ok(())
     }
 
+    /// Reads a node's paravirtual framebuffer (`XRGB8888`, `bgr0` byte order)
+    /// directly from guest RAM without perturbing execution.
+    pub fn read_node_framebuffer(
+        &mut self,
+        node: usize,
+    ) -> Result<Option<(crate::FramebufferInfo, Vec<u8>)>> {
+        let live = self
+            .nodes
+            .get_mut(node)
+            .with_context(|| format!("node index {node} out of range"))?;
+        match &mut live.backend {
+            NodeBackend::Local(opt) => match opt.as_ref() {
+                Some(m) => m.read_framebuffer(),
+                None => Ok(None),
+            },
+            NodeBackend::Worker(w) => {
+                if live.meta.is_none() {
+                    return Ok(None);
+                }
+                w.send(WorkerReq::ReadFramebuffer)?;
+                match w.recv()? {
+                    WorkerResp::Framebuffer(res) => *res,
+                    _ => bail!(
+                        "unexpected response to ReadFramebuffer from node {}",
+                        live.cfg.name
+                    ),
+                }
+            }
+        }
+    }
+
     /// Clones a live node's [`Machine`] via a non-destructive in-memory
     /// snapshot so callers can run `cat`/`files` mid-simulation without
     /// perturbing the live VM's state or dirty-page log.
@@ -3314,6 +3422,15 @@ impl Cluster {
             FaultAction::Crash(idx) => {
                 if let Some(node) = self.nodes.get_mut(idx) {
                     node.crash()?;
+                }
+            }
+            FaultAction::SendInput(idx, data) => {
+                if idx < self.nodes.len() {
+                    if self.nodes[idx].is_alive() && !self.nodes[idx].is_runnable() {
+                        let wake_ns = at_ns.max(self.cluster_ns);
+                        self.advance_idle_node_to(idx, wake_ns)?;
+                    }
+                    self.nodes[idx].send_input(data)?;
                 }
             }
             FaultAction::Restart(idx) => {

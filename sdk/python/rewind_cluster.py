@@ -123,6 +123,9 @@ class NodeHandle:
     def restart(self) -> Dict[str, Any]:
         return self._cluster.restart(self.name)
 
+    def send_input(self, data: Union[str, bytes]) -> Dict[str, Any]:
+        return self._cluster.send_input(self.name, data)
+
     def isolate(self, *, symmetric: bool = True) -> Dict[str, Any]:
         return self._cluster.partition([self.name], None, symmetric=symmetric)
 
@@ -235,6 +238,9 @@ class Cluster:
         cores: Optional[int] = None,
         clock_skew_ms: int = 0,
         clock_drift_ppm: int = 0,
+        display: bool = False,
+        display_width: Optional[int] = None,
+        display_height: Optional[int] = None,
         files: Optional[Dict[str, str]] = None,
     ) -> NodeHandle:
         """Registers a node before calling :meth:`start`."""
@@ -274,6 +280,12 @@ class Cluster:
             node["mem_mib"] = mem_mib
         if cores is not None:
             node["cores"] = cores
+        if display:
+            node["display"] = True
+        if display_width is not None:
+            node["display_width"] = display_width
+        if display_height is not None:
+            node["display_height"] = display_height
         self._nodes.append(node)
         return NodeHandle(self, name)
 
@@ -523,6 +535,17 @@ class Cluster:
 
     def restart(self, node: str) -> Dict[str, Any]:
         return self._call("cluster.restart", {"node": node})
+
+    def send_input(self, node: str, data: Union[str, bytes]) -> Dict[str, Any]:
+        """Injects deterministic console input into ``node``'s ``/dev/rewind-console``."""
+        if isinstance(data, bytes):
+            params: Dict[str, Any] = {
+                "node": node,
+                "data_base64": base64.b64encode(data).decode("ascii"),
+            }
+        else:
+            params = {"node": node, "data": data}
+        return self._call("cluster.send_input", params)
 
     def logs(
         self, node: str, *, stream: str = "output", since: int = 0

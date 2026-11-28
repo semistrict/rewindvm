@@ -61,6 +61,8 @@ let
     ../guest/linux/rewind-cpus.patch
     # Paravirtual Ethernet NIC (eth0) for multi-node cluster runs
     ../guest/linux/rewind-net.patch
+    # Paravirtual framebuffer (/dev/fb0) for deterministic desktop screencasts
+    ../guest/linux/rewind-fb.patch
   ];
 
   # Only the guest/linux/ subtree is needed to patch the ARM64 kernel, keeping
