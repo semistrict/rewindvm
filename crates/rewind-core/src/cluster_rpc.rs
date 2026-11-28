@@ -197,6 +197,10 @@ struct NodeStartParams {
     #[serde(default)]
     clock_drift_ppm: i32,
     #[serde(default)]
+    display: bool,
+    display_width: Option<u32>,
+    display_height: Option<u32>,
+    #[serde(default)]
     files: Vec<NodeFileSpec>,
 }
 
@@ -262,6 +266,9 @@ fn dispatch(
                         cores: n.cores,
                         clock_skew_ms: n.clock_skew_ms,
                         clock_drift_ppm: n.clock_drift_ppm,
+                        display: n.display,
+                        display_width: n.display_width,
+                        display_height: n.display_height,
                         files: n.files,
                     })
                     .collect(),

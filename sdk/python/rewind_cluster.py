@@ -238,6 +238,9 @@ class Cluster:
         cores: Optional[int] = None,
         clock_skew_ms: int = 0,
         clock_drift_ppm: int = 0,
+        display: bool = False,
+        display_width: Optional[int] = None,
+        display_height: Optional[int] = None,
         files: Optional[Dict[str, str]] = None,
     ) -> NodeHandle:
         """Registers a node before calling :meth:`start`."""
@@ -277,6 +280,12 @@ class Cluster:
             node["mem_mib"] = mem_mib
         if cores is not None:
             node["cores"] = cores
+        if display:
+            node["display"] = True
+        if display_width is not None:
+            node["display_width"] = display_width
+        if display_height is not None:
+            node["display_height"] = display_height
         self._nodes.append(node)
         return NodeHandle(self, name)
 

@@ -137,6 +137,9 @@ pub struct FdtConfig<'a> {
     pub seed: [u8; 32],
     pub pmem: Option<(u64, u64)>,
     pub extras: Option<(u64, u64)>,
+    /// Optional `simple-framebuffer` node under `/chosen`:
+    /// `(gpa, alloc_size, width, height, stride)`.
+    pub framebuffer: Option<(u64, u64, u32, u32, u32)>,
 }
 
 /// Builds the complete DTB for an ARM64 Rewind guest.
@@ -156,6 +159,20 @@ pub fn build(cfg: &FdtConfig<'_>) -> Vec<u8> {
         fdt.prop_u64("linux,initrd-end", cfg.initrd_end);
     }
     fdt.prop_bytes("rng-seed", &cfg.seed);
+    if let Some((fb_addr, fb_alloc_size, width, height, stride)) = cfg.framebuffer {
+        fdt.prop_u32("#address-cells", 2);
+        fdt.prop_u32("#size-cells", 2);
+        fdt.prop_bytes("ranges", &[]);
+        fdt.begin_node(&format!("framebuffer@{fb_addr:x}"));
+        fdt.prop_str("compatible", "simple-framebuffer");
+        fdt.prop_u64_pair("reg", fb_addr, fb_alloc_size);
+        fdt.prop_u32("width", width);
+        fdt.prop_u32("height", height);
+        fdt.prop_u32("stride", stride);
+        fdt.prop_str("format", "x8r8g8b8");
+        fdt.prop_str("status", "okay");
+        fdt.end_node();
+    }
     fdt.end_node();
 
     // /memory
@@ -215,6 +232,7 @@ mod tests {
             seed: [7; 32],
             pmem: Some((0x1_0000_0000, 4 << 20)),
             extras: None,
+            framebuffer: Some((0x4fc0_0000, 4 << 20, 1280, 720, 1280 * 4)),
         };
         let a = build(&cfg);
         let b = build(&cfg);
@@ -226,5 +244,9 @@ mod tests {
         );
         assert!(a.windows(b"rewind,platform".len()).any(|w| w == b"rewind,platform"));
         assert!(a.windows(b"pmem-region".len()).any(|w| w == b"pmem-region"));
+        assert!(
+            a.windows(b"simple-framebuffer".len())
+                .any(|w| w == b"simple-framebuffer")
+        );
     }
 }

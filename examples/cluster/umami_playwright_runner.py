@@ -14,6 +14,8 @@ Lifecycle:
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -23,6 +25,106 @@ from playwright.sync_api import sync_playwright
 
 APP_URL = os.environ.get("UMAMI_URL", "http://10.0.0.2:3000")
 CONSOLE_DEV = "/dev/rewind-console"
+
+
+def start_wayland_compositor() -> tuple[list[subprocess.Popen], dict[str, str]]:
+    """Starts seatd + labwc (wlroots/pixman) on /dev/dri/card0 when available.
+
+    Returns `(background_procs, extra_env)` so Chromium can run headed as a
+    native Wayland client (`--ozone-platform=wayland`), painting deterministically
+    into the guest's `simpledrm` framebuffer for `rewind cluster video`.
+    """
+    if not os.path.exists("/dev/dri/card0"):
+        return [], {}
+    seatd_bin = shutil.which("seatd")
+    labwc_bin = shutil.which("labwc")
+    if not seatd_bin or not labwc_bin:
+        return [], {}
+
+    os.makedirs("/run", exist_ok=True)
+    xdg_dir = "/tmp/xdg"
+    os.makedirs(xdg_dir, mode=0o700, exist_ok=True)
+    os.chmod(xdg_dir, 0o700)
+
+    # Minimal labwc config: borderless maximized windows so Chromium fills 1280x720.
+    cfg_dir = "/tmp/labwc-cfg"
+    os.makedirs(cfg_dir, exist_ok=True)
+    with open(f"{cfg_dir}/rc.xml", "w", encoding="utf-8") as f:
+        f.write(
+            '<?xml version="1.0"?>\n'
+            "<labwc_config>\n"
+            "  <windowRules>\n"
+            '    <windowRule identifier="*">\n'
+            '      <action name="Maximize" />\n'
+            '      <action name="ToggleDecorations" />\n'
+            "    </windowRule>\n"
+            "  </windowRules>\n"
+            "</labwc_config>\n"
+        )
+
+    procs: list[subprocess.Popen] = []
+    seatd_sock = "/run/seatd.sock"
+    if os.path.exists(seatd_sock):
+        os.unlink(seatd_sock)
+    seatd_log = open("/tmp/seatd.log", "wb")
+    procs.append(
+        subprocess.Popen(
+            [seatd_bin, "-l", "error"],
+            stdout=seatd_log,
+            stderr=seatd_log,
+        )
+    )
+    deadline = time.monotonic() + 10.0
+    while not os.path.exists(seatd_sock) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not os.path.exists(seatd_sock):
+        raise RuntimeError("seatd did not create /run/seatd.sock")
+
+    wl_env = os.environ.copy()
+    wl_env.update(
+        {
+            "XDG_RUNTIME_DIR": xdg_dir,
+            "LIBSEAT_BACKEND": "seatd",
+            "SEATD_SOCK": seatd_sock,
+            "WLR_BACKENDS": "drm",
+            "WLR_RENDERER": "pixman",
+            "WLR_LIBINPUT_NO_DEVICES": "1",
+            "WLR_DRM_DEVICES": "/dev/dri/card0",
+            "WLR_NO_HARDWARE_CURSORS": "1",
+        }
+    )
+    labwc_log = open("/tmp/labwc.log", "wb")
+    procs.append(
+        subprocess.Popen(
+            [labwc_bin, "-C", cfg_dir],
+            env=wl_env,
+            stdout=labwc_log,
+            stderr=labwc_log,
+        )
+    )
+
+    wl_sock = None
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        for entry in sorted(os.listdir(xdg_dir)):
+            if entry.startswith("wayland-") and not entry.endswith(".lock"):
+                wl_sock = entry
+                break
+        if wl_sock:
+            break
+        if procs[-1].poll() is not None:
+            labwc_log.flush()
+            with open("/tmp/labwc.log", "r", errors="replace") as lf:
+                raise RuntimeError(f"labwc exited early: {lf.read()}")
+        time.sleep(0.05)
+    if not wl_sock:
+        raise RuntimeError("timed out waiting for labwc Wayland socket")
+
+    print(f"WAYLAND_READY:{wl_sock}", flush=True)
+    return procs, {
+        "XDG_RUNTIME_DIR": xdg_dir,
+        "WAYLAND_DISPLAY": wl_sock,
+    }
 
 
 def wait_for_http(url: str, timeout_s: float = 120.0) -> None:
@@ -231,16 +333,30 @@ def main() -> None:
     wait_for_http(f"{APP_URL}/api/heartbeat", timeout_s=120.0)
     print("APP_REACHABLE", flush=True)
 
+    wl_procs, wl_env = start_wayland_compositor()
+    if wl_env:
+        os.environ.update(wl_env)
+
+    chromium_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+    ]
+    if wl_env:
+        chromium_args.extend(
+            [
+                "--ozone-platform=wayland",
+                "--window-size=1280,720",
+                "--start-maximized",
+            ]
+        )
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             channel="chromium",
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            headless=not bool(wl_env),
+            args=chromium_args,
         )
         context = browser.new_context(viewport={"width": 1280, "height": 720})
         page = context.new_page()
@@ -315,6 +431,8 @@ def main() -> None:
             print(f"PASS:{spec}", flush=True)
 
         browser.close()
+    for proc in reversed(wl_procs):
+        proc.terminate()
 
 
 if __name__ == "__main__":

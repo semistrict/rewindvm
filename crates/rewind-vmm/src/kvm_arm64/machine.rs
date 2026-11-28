@@ -188,6 +188,13 @@ impl Machine {
         let immediate_exit = &raw mut vcpu.get_kvm_run().immediate_exit;
         let interrupt = interrupt::Shared::new(immediate_exit);
 
+        let fb_region = config
+            .fb
+            .map(|fb| {
+                crate::framebuffer_layout(RAM_BASE, ram.len() as u64, fb).map(|(info, _, _)| info)
+            })
+            .transpose()?;
+
         Ok(Machine {
             vcpu,
             vm,
@@ -212,6 +219,7 @@ impl Machine {
                 event_pending: false,
                 event_buffer: Vec::new(),
                 net_config: config.net,
+                fb_region,
                 net_rx_ring: None,
                 net_rx_slots: 0,
                 tx_queue: std::collections::VecDeque::new(),
@@ -262,6 +270,7 @@ impl Machine {
             seed: self.config.seed,
             pmem_len: self.pmem.as_ref().map_or(0, |p| p.len() as u64),
             extras_len: self.extras.as_ref().map_or(0, |e| e.len() as u64),
+            fb: self.config.fb,
         };
         match into {
             BootInto::Ram => boot::load(&mut self.dev.ram, &spec),
@@ -477,6 +486,10 @@ impl Machine {
         let _ = self.inject(pv::PENDING_INPUT)?;
         self.dev.idle = false;
         Ok(())
+    }
+
+    pub fn read_framebuffer(&self) -> Result<Option<(crate::FramebufferInfo, Vec<u8>)>> {
+        self.dev.read_framebuffer()
     }
 
     pub fn advance_idle_to(&mut self, target_local_ns: u64) -> Result<()> {
@@ -991,6 +1004,7 @@ mod tests {
             preemption: crate::Preemption::AtExits,
             extras: crate::Extras::Absent,
             net: None,
+            fb: None,
         }
     }
 

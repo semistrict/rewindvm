@@ -171,6 +171,13 @@ impl Machine {
         let interrupt = interrupt::Shared::new(vcpu.id());
         let dirty = DirtyTracker::new(ram.len(), dirty_log == DirtyLog::On);
 
+        let fb_region = config
+            .fb
+            .map(|fb| {
+                crate::framebuffer_layout(RAM_BASE, ram.len() as u64, fb).map(|(info, _, _)| info)
+            })
+            .transpose()?;
+
         Ok(Machine {
             vcpu,
             vm,
@@ -194,6 +201,7 @@ impl Machine {
                 event_pending: false,
                 event_buffer: Vec::new(),
                 net_config: config.net,
+                fb_region,
                 net_rx_ring: None,
                 net_rx_slots: 0,
                 tx_queue: std::collections::VecDeque::new(),
@@ -244,6 +252,7 @@ impl Machine {
             seed: self.config.seed,
             pmem_len: self.pmem.as_ref().map_or(0, |p| p.len() as u64),
             extras_len: self.extras.as_ref().map_or(0, |e| e.len() as u64),
+            fb: self.config.fb,
         };
         match into {
             BootInto::Ram => boot::load(&mut self.dev.ram, &spec),
@@ -448,6 +457,10 @@ impl Machine {
             self.dev.idle = false;
         }
         Ok(())
+    }
+
+    pub fn read_framebuffer(&self) -> Result<Option<(crate::FramebufferInfo, Vec<u8>)>> {
+        self.dev.read_framebuffer()
     }
 
     pub fn is_idle(&self) -> bool {
@@ -1021,6 +1034,7 @@ mod tests {
             preemption: crate::Preemption::AtExits,
             extras: crate::Extras::Absent,
             net: None,
+            fb: None,
         }
     }
 
