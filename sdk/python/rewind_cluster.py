@@ -1,40 +1,59 @@
-"""Python SDK for Rewind VM multi-node deterministic cluster simulation.
+"""Async Python SDK for Rewind VM multi-node deterministic cluster simulation.
 
 Speaks NDJSON-RPC 2.0 to ``rewind cluster serve`` over stdin/stdout (default)
-or a Unix domain socket. Zero third-party dependencies — stdlib only.
+or a Unix domain socket using ``asyncio``. Zero third-party dependencies —
+stdlib only.
 
 Example::
 
+    import asyncio
     from rewind_cluster import Cluster
 
-    with Cluster("raft-test", latency_ms=2, jitter_us=200) as c:
-        n1 = c.add_node("node1", ["/bin/sh", "-c", "..."], ip="10.0.0.1")
-        n2 = c.add_node("node2", ["/bin/sh", "-c", "..."], ip="10.0.0.2")
-        cli = c.add_node("client", ["/bin/sh", "-c", "..."], role="driver")
-        c.start()
+    async def main() -> None:
+        async with Cluster("raft-test", latency_ms=2, jitter_us=200) as c:
+            n1 = c.add_node("node1", ["/bin/sh", "-c", "..."], ip="10.0.0.1")
+            n2 = c.add_node("node2", ["/bin/sh", "-c", "..."], ip="10.0.0.2")
+            cli = c.add_node("client", ["/bin/sh", "-c", "..."], role="driver")
+            await c.start()
 
-        n1.wait_for("ready")
-        snap = c.snapshot("after-boot")
-        c.partition(["node1"], ["node2", "client"])
-        c.advance(ms=500)
-        assert n1.cat("/tmp/state").strip() == "ok"
-        c.heal()
-        cli.wait_exit()
+            await n1.wait_for("ready")
+            snap = await c.snapshot("after-boot")
+            await c.partition(["node1"], ["node2", "client"])
+            await c.advance(ms=500)
+            assert (await n1.cat("/tmp/state")).strip() == "ok"
+            await c.heal()
+            await cli.wait_exit()
+
+    asyncio.run(main())
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
-import socket
-import subprocess
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+# Generous asyncio StreamReader line limit so large base64 `cat`/`logs` RPC
+# replies never trip asyncio's default 64 KiB LimitOverrunError.
+_STREAM_LIMIT = 64 * 1024 * 1024
 
 __all__ = [
     "Cluster",
@@ -127,13 +146,13 @@ class WaitResult:
 
 
 class NodeHandle:
-    """Convenience handle for one node in a :class:`Cluster`."""
+    """Async convenience handle for one node in a :class:`Cluster`."""
 
     def __init__(self, cluster: "Cluster", name: str) -> None:
         self._cluster = cluster
         self.name = name
 
-    def wait_for(
+    async def wait_for(
         self,
         contains: str,
         *,
@@ -143,7 +162,7 @@ class NodeHandle:
         wall_timeout_ms: Optional[int] = None,
         check: bool = True,
     ) -> WaitResult:
-        return self._cluster.wait_for(
+        return await self._cluster.wait_for(
             self.name,
             contains,
             stream=stream,
@@ -153,36 +172,40 @@ class NodeHandle:
             check=check,
         )
 
-    def wait_exit(
+    async def wait_exit(
         self,
         *,
         timeout_ms: Optional[int] = 30_000,
         wall_timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
-        return self._cluster.wait_exit(
+        return await self._cluster.wait_exit(
             self.name, timeout_ms=timeout_ms, wall_timeout_ms=wall_timeout_ms
         )
 
-    def crash(self) -> Dict[str, Any]:
-        return self._cluster.crash(self.name)
+    async def crash(self) -> Dict[str, Any]:
+        return await self._cluster.crash(self.name)
 
-    def restart(self) -> Dict[str, Any]:
-        return self._cluster.restart(self.name)
+    async def restart(self) -> Dict[str, Any]:
+        return await self._cluster.restart(self.name)
 
-    def send_input(self, data: Union[str, bytes]) -> Dict[str, Any]:
-        return self._cluster.send_input(self.name, data)
+    async def send_input(self, data: Union[str, bytes]) -> Dict[str, Any]:
+        return await self._cluster.send_input(self.name, data)
 
-    def send_hid(self, events: Sequence[Tuple[int, int, int]]) -> Dict[str, Any]:
+    async def send_hid(
+        self, events: Sequence[Tuple[int, int, int]]
+    ) -> Dict[str, Any]:
         """Injects raw Linux evdev ``(type, code, value)`` HID events."""
-        return self._cluster.send_hid(self.name, events)
+        return await self._cluster.send_hid(self.name, events)
 
-    def mouse_move(
+    async def mouse_move(
         self, x: int, y: int, *, width: int = 1280, height: int = 720
     ) -> Dict[str, Any]:
         """Moves the absolute pointer to pixel ``(x, y)`` on a ``width x height`` display."""
-        return self._cluster.mouse_move(self.name, x, y, width=width, height=height)
+        return await self._cluster.mouse_move(
+            self.name, x, y, width=width, height=height
+        )
 
-    def click(
+    async def click(
         self,
         x: int,
         y: int,
@@ -194,7 +217,7 @@ class NodeHandle:
         hold_ms: int = 30,
     ) -> Dict[str, Any]:
         """Moves the pointer to ``(x, y)`` and clicks ``button`` deterministically."""
-        return self._cluster.click(
+        return await self._cluster.click(
             self.name,
             x,
             y,
@@ -205,35 +228,39 @@ class NodeHandle:
             hold_ms=hold_ms,
         )
 
-    def key(self, key_name: str, *, hold_ms: int = 20) -> Dict[str, Any]:
+    async def key(self, key_name: str, *, hold_ms: int = 20) -> Dict[str, Any]:
         """Presses and releases one named key (e.g. ``'enter'``, ``'tab'``, ``'a'``)."""
-        return self._cluster.key(self.name, key_name, hold_ms=hold_ms)
+        return await self._cluster.key(self.name, key_name, hold_ms=hold_ms)
 
-    def type_text(self, text: str, *, delay_ms: int = 15) -> None:
+    async def type_text(self, text: str, *, delay_ms: int = 15) -> None:
         """Types an ASCII string deterministically via ``/dev/input/event1``."""
-        self._cluster.type_text(self.name, text, delay_ms=delay_ms)
+        await self._cluster.type_text(self.name, text, delay_ms=delay_ms)
 
-    def isolate(self, *, symmetric: bool = True) -> Dict[str, Any]:
-        return self._cluster.partition([self.name], None, symmetric=symmetric)
+    async def isolate(self, *, symmetric: bool = True) -> Dict[str, Any]:
+        return await self._cluster.partition([self.name], None, symmetric=symmetric)
 
-    def heal(self) -> Dict[str, Any]:
-        return self._cluster.heal([self.name])
+    async def heal(self) -> Dict[str, Any]:
+        return await self._cluster.heal([self.name])
 
-    def cat(self, path: str, *, pid: Optional[int] = None) -> str:
-        return self._cluster.cat(self.name, path, pid=pid)
+    async def cat(self, path: str, *, pid: Optional[int] = None) -> str:
+        return await self._cluster.cat(self.name, path, pid=pid)
 
-    def cat_bytes(self, path: str, *, pid: Optional[int] = None) -> bytes:
-        return self._cluster.cat_bytes(self.name, path, pid=pid)
+    async def cat_bytes(self, path: str, *, pid: Optional[int] = None) -> bytes:
+        return await self._cluster.cat_bytes(self.name, path, pid=pid)
 
-    def files(self, path: str, *, pid: Optional[int] = None) -> List[Dict[str, Any]]:
-        return self._cluster.files(self.name, path, pid=pid)
+    async def files(
+        self, path: str, *, pid: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        return await self._cluster.files(self.name, path, pid=pid)
 
-    def logs(self, *, stream: str = "output", since: int = 0) -> List[str]:
-        return self._cluster.logs(self.name, stream=stream, since=since)["lines"]
+    async def logs(self, *, stream: str = "output", since: int = 0) -> List[str]:
+        return (await self._cluster.logs(self.name, stream=stream, since=since))[
+            "lines"
+        ]
 
 
 class Cluster:
-    """Interactive controller for a deterministic multi-node Rewind VM cluster."""
+    """Async interactive controller for a deterministic multi-node Rewind VM cluster."""
 
     def __init__(
         self,
@@ -299,10 +326,10 @@ class Cluster:
 
         self._nodes: List[Dict[str, Any]] = []
         self._links: List[Dict[str, Any]] = []
-        self._proc: Optional[subprocess.Popen[bytes]] = None
-        self._sock: Optional[socket.socket] = None
-        self._rfile: Any = None
-        self._wfile: Any = None
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._call_lock: Optional[asyncio.Lock] = None
         self._req_id = 0
         self._started = False
         self._finished = False
@@ -404,52 +431,63 @@ class Cluster:
                 entry["drop_ppm"] = drop_ppm
             self._links.append(entry)
 
-    def _connect(self) -> None:
-        if self._wfile is not None:
+    def node(self, name: str) -> NodeHandle:
+        """Returns a :class:`NodeHandle` for ``name`` (useful after :meth:`from_snapshot`)."""
+        return NodeHandle(self, name)
+
+    async def _connect(self) -> None:
+        if self._writer is not None:
             return
         if self._socket_path:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(self._socket_path)
-            self._sock = sock
-            self._rfile = sock.makefile("rb")
-            self._wfile = sock.makefile("wb")
+            self._reader, self._writer = await asyncio.open_unix_connection(
+                self._socket_path, limit=_STREAM_LIMIT
+            )
             return
         cmd = [self._rewind_bin, "cluster", "serve"]
         if self._clock:
             cmd.extend(["--clock", self._clock])
         if self._cpu:
             cmd.extend(["--cpu", self._cpu])
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
             stderr=None,
+            limit=_STREAM_LIMIT,
         )
         assert self._proc.stdin is not None and self._proc.stdout is not None
-        self._wfile = self._proc.stdin
-        self._rfile = self._proc.stdout
+        self._writer = self._proc.stdin
+        self._reader = self._proc.stdout
 
-    def _call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        self._connect()
-        self._req_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._req_id,
-            "method": method,
-            "params": params or {},
-        }
-        line = (json.dumps(payload) + "\n").encode("utf-8")
-        self._wfile.write(line)
-        self._wfile.flush()
-        raw = self._rfile.readline()
-        if not raw:
-            raise ClusterError(f"rewind cluster serve closed connection during {method}")
-        resp = json.loads(raw.decode("utf-8"))
-        if "error" in resp and resp["error"] is not None:
-            raise ClusterError(resp["error"].get("message", str(resp["error"])))
-        return resp.get("result")
+    async def _call(
+        self, method: str, params: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        if self._call_lock is None:
+            self._call_lock = asyncio.Lock()
+        async with self._call_lock:
+            await self._connect()
+            assert self._writer is not None and self._reader is not None
+            self._req_id += 1
+            payload = {
+                "jsonrpc": "2.0",
+                "id": self._req_id,
+                "method": method,
+                "params": params or {},
+            }
+            line = (json.dumps(payload) + "\n").encode("utf-8")
+            self._writer.write(line)
+            await self._writer.drain()
+            raw = await self._reader.readline()
+            if not raw:
+                raise ClusterError(
+                    f"rewind cluster serve closed connection during {method}"
+                )
+            resp = json.loads(raw.decode("utf-8"))
+            if "error" in resp and resp["error"] is not None:
+                raise ClusterError(resp["error"].get("message", str(resp["error"])))
+            return resp.get("result")
 
-    def start(self) -> Dict[str, Any]:
+    async def start(self) -> Dict[str, Any]:
         """Boots all configured VMs and begins deterministic recording."""
         if not self._nodes:
             raise ClusterError("add at least one node before calling start()")
@@ -480,14 +518,14 @@ class Cluster:
         if self._keyframes is not None:
             params["keyframes"] = self._keyframes
 
-        res = self._call("cluster.start", params)
+        res = await self._call("cluster.start", params)
         self._started = True
         return res
 
-    def status(self) -> Dict[str, Any]:
-        return self._call("cluster.status")
+    async def status(self) -> Dict[str, Any]:
+        return await self._call("cluster.status")
 
-    def advance(
+    async def advance(
         self,
         *,
         ms: Optional[int] = None,
@@ -507,9 +545,9 @@ class Cluster:
             params["until_ms"] = until_ms
         if wall_timeout_ms is not None:
             params["wall_timeout_ms"] = wall_timeout_ms
-        return self._call("cluster.advance", params)
+        return await self._call("cluster.advance", params)
 
-    def wait_for(
+    async def wait_for(
         self,
         node: str,
         contains: str,
@@ -530,7 +568,7 @@ class Cluster:
             params["timeout_ms"] = timeout_ms
         if wall_timeout_ms is not None:
             params["wall_timeout_ms"] = wall_timeout_ms
-        res = self._call("cluster.wait_for", params)
+        res = await self._call("cluster.wait_for", params)
         out = WaitResult(
             matched=bool(res["matched"]),
             line=res.get("line"),
@@ -545,7 +583,7 @@ class Cluster:
             )
         return out
 
-    def wait_exit(
+    async def wait_exit(
         self,
         node: Optional[str] = None,
         *,
@@ -559,9 +597,9 @@ class Cluster:
             params["timeout_ms"] = timeout_ms
         if wall_timeout_ms is not None:
             params["wall_timeout_ms"] = wall_timeout_ms
-        return self._call("cluster.wait_exit", params)
+        return await self._call("cluster.wait_exit", params)
 
-    def partition(
+    async def partition(
         self,
         a: Iterable[str],
         b: Optional[Iterable[str]] = None,
@@ -571,9 +609,9 @@ class Cluster:
         params: Dict[str, Any] = {"a": list(a), "symmetric": symmetric}
         if b is not None:
             params["b"] = list(b)
-        return self._call("cluster.partition", params)
+        return await self._call("cluster.partition", params)
 
-    def heal(
+    async def heal(
         self,
         a: Optional[Iterable[str]] = None,
         b: Optional[Iterable[str]] = None,
@@ -583,9 +621,9 @@ class Cluster:
             params["a"] = list(a)
         if b is not None:
             params["b"] = list(b)
-        return self._call("cluster.heal", params)
+        return await self._call("cluster.heal", params)
 
-    def set_link(
+    async def set_link(
         self,
         src: str,
         dst: str,
@@ -615,15 +653,15 @@ class Cluster:
             params["drop_ppm"] = drop_ppm
         if duplicate_ppm is not None:
             params["duplicate_ppm"] = duplicate_ppm
-        return self._call("cluster.set_link", params)
+        return await self._call("cluster.set_link", params)
 
-    def crash(self, node: str) -> Dict[str, Any]:
-        return self._call("cluster.crash", {"node": node})
+    async def crash(self, node: str) -> Dict[str, Any]:
+        return await self._call("cluster.crash", {"node": node})
 
-    def restart(self, node: str) -> Dict[str, Any]:
-        return self._call("cluster.restart", {"node": node})
+    async def restart(self, node: str) -> Dict[str, Any]:
+        return await self._call("cluster.restart", {"node": node})
 
-    def send_input(self, node: str, data: Union[str, bytes]) -> Dict[str, Any]:
+    async def send_input(self, node: str, data: Union[str, bytes]) -> Dict[str, Any]:
         """Injects deterministic console input into ``node``'s ``/dev/rewind-console``."""
         if isinstance(data, bytes):
             params: Dict[str, Any] = {
@@ -632,23 +670,23 @@ class Cluster:
             }
         else:
             params = {"node": node, "data": data}
-        return self._call("cluster.send_input", params)
+        return await self._call("cluster.send_input", params)
 
-    def send_hid(
+    async def send_hid(
         self, node: str, events: Sequence[Tuple[int, int, int]]
     ) -> Dict[str, Any]:
         """Injects deterministic Linux evdev ``(type, code, value)`` events."""
         payload = [
             {"type": int(t), "code": int(c), "value": int(v)} for t, c, v in events
         ]
-        return self._call("cluster.send_hid", {"node": node, "events": payload})
+        return await self._call("cluster.send_hid", {"node": node, "events": payload})
 
-    def mouse_move(
+    async def mouse_move(
         self, node: str, x: int, y: int, *, width: int = 1280, height: int = 720
     ) -> Dict[str, Any]:
         ax = max(0, min(32767, int(round(x * 32767 / max(1, width - 1)))))
         ay = max(0, min(32767, int(round(y * 32767 / max(1, height - 1)))))
-        return self.send_hid(
+        return await self.send_hid(
             node,
             [
                 (EV_ABS, ABS_X, ax),
@@ -657,7 +695,7 @@ class Cluster:
             ],
         )
 
-    def click(
+    async def click(
         self,
         node: str,
         x: int,
@@ -671,33 +709,37 @@ class Cluster:
     ) -> Dict[str, Any]:
         btn = _BUTTON_CODES.get(button.lower())
         if btn is None:
-            raise ValueError(f"unknown mouse button {button!r} (expected left, right, middle)")
-        self.mouse_move(node, x, y, width=width, height=height)
+            raise ValueError(
+                f"unknown mouse button {button!r} (expected left, right, middle)"
+            )
+        await self.mouse_move(node, x, y, width=width, height=height)
         if move_ms > 0:
-            self.advance(ms=move_ms)
-        self.send_hid(node, [(EV_KEY, btn, 1), (EV_SYN, SYN_REPORT, 0)])
+            await self.advance(ms=move_ms)
+        await self.send_hid(node, [(EV_KEY, btn, 1), (EV_SYN, SYN_REPORT, 0)])
         if hold_ms > 0:
-            self.advance(ms=hold_ms)
-        return self.send_hid(node, [(EV_KEY, btn, 0), (EV_SYN, SYN_REPORT, 0)])
+            await self.advance(ms=hold_ms)
+        return await self.send_hid(node, [(EV_KEY, btn, 0), (EV_SYN, SYN_REPORT, 0)])
 
-    def key(self, node: str, key_name: str, *, hold_ms: int = 20) -> Dict[str, Any]:
+    async def key(
+        self, node: str, key_name: str, *, hold_ms: int = 20
+    ) -> Dict[str, Any]:
         code = _KEY_NAMES.get(key_name.lower())
         if code is None:
             raise ValueError(f"unknown key name {key_name!r}")
-        self.send_hid(node, [(EV_KEY, code, 1), (EV_SYN, SYN_REPORT, 0)])
+        await self.send_hid(node, [(EV_KEY, code, 1), (EV_SYN, SYN_REPORT, 0)])
         if hold_ms > 0:
-            self.advance(ms=hold_ms)
-        return self.send_hid(node, [(EV_KEY, code, 0), (EV_SYN, SYN_REPORT, 0)])
+            await self.advance(ms=hold_ms)
+        return await self.send_hid(node, [(EV_KEY, code, 0), (EV_SYN, SYN_REPORT, 0)])
 
-    def type_text(self, node: str, text: str, *, delay_ms: int = 15) -> None:
+    async def type_text(self, node: str, text: str, *, delay_ms: int = 15) -> None:
         for ch in text:
             if ch == "\n":
-                self.key(node, "enter", hold_ms=delay_ms)
+                await self.key(node, "enter", hold_ms=delay_ms)
             elif ch == "\t":
-                self.key(node, "tab", hold_ms=delay_ms)
+                await self.key(node, "tab", hold_ms=delay_ms)
             elif "A" <= ch <= "Z":
                 code = _KEY_NAMES[ch.lower()]
-                self.send_hid(
+                await self.send_hid(
                     node,
                     [
                         (EV_KEY, KEY_LEFTSHIFT, 1),
@@ -706,8 +748,8 @@ class Cluster:
                     ],
                 )
                 if delay_ms > 0:
-                    self.advance(ms=delay_ms)
-                self.send_hid(
+                    await self.advance(ms=delay_ms)
+                await self.send_hid(
                     node,
                     [
                         (EV_KEY, code, 0),
@@ -717,7 +759,7 @@ class Cluster:
                 )
             elif ch in _SHIFTED_CHARS:
                 code = _SHIFTED_CHARS[ch]
-                self.send_hid(
+                await self.send_hid(
                     node,
                     [
                         (EV_KEY, KEY_LEFTSHIFT, 1),
@@ -726,8 +768,8 @@ class Cluster:
                     ],
                 )
                 if delay_ms > 0:
-                    self.advance(ms=delay_ms)
-                self.send_hid(
+                    await self.advance(ms=delay_ms)
+                await self.send_hid(
                     node,
                     [
                         (EV_KEY, code, 0),
@@ -736,66 +778,66 @@ class Cluster:
                     ],
                 )
             elif ch in _KEY_NAMES:
-                self.key(node, ch, hold_ms=delay_ms)
+                await self.key(node, ch, hold_ms=delay_ms)
             else:
                 raise ValueError(f"unsupported ASCII character {ch!r} in type_text")
             if delay_ms > 0:
-                self.advance(ms=delay_ms)
+                await self.advance(ms=delay_ms)
 
-    def logs(
+    async def logs(
         self, node: str, *, stream: str = "output", since: int = 0
     ) -> Dict[str, Any]:
-        return self._call(
+        return await self._call(
             "cluster.logs", {"node": node, "stream": stream, "since": since}
         )
 
-    def net_events(self, *, since: int = 0) -> Dict[str, Any]:
-        return self._call("cluster.net_events", {"since": since})
+    async def net_events(self, *, since: int = 0) -> Dict[str, Any]:
+        return await self._call("cluster.net_events", {"since": since})
 
-    def cat_bytes(
+    async def cat_bytes(
         self, node: str, path: str, *, pid: Optional[int] = None
     ) -> bytes:
         params: Dict[str, Any] = {"node": node, "path": path}
         if pid is not None:
             params["pid"] = pid
-        res = self._call("cluster.cat", params)
+        res = await self._call("cluster.cat", params)
         if not res.get("found"):
             raise FileNotFoundError(res.get("error") or f"{node}:{path} not found")
         return base64.b64decode(res["content_base64"])
 
-    def cat(self, node: str, path: str, *, pid: Optional[int] = None) -> str:
-        return self.cat_bytes(node, path, pid=pid).decode("utf-8", errors="replace")
+    async def cat(self, node: str, path: str, *, pid: Optional[int] = None) -> str:
+        return (await self.cat_bytes(node, path, pid=pid)).decode(
+            "utf-8", errors="replace"
+        )
 
-    def files(
+    async def files(
         self, node: str, path: str, *, pid: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"node": node, "path": path}
         if pid is not None:
             params["pid"] = pid
-        res = self._call("cluster.files", params)
+        res = await self._call("cluster.files", params)
         if not res.get("found"):
             raise FileNotFoundError(res.get("error") or f"{node}:{path} not found")
         return res["entries"]
 
-    def snapshot(self, name: Optional[str] = None) -> str:
+    async def snapshot(self, name: Optional[str] = None) -> str:
         params = {"name": name} if name is not None else {}
-        res = self._call("cluster.snapshot", params)
+        res = await self._call("cluster.snapshot", params)
         return str(res["snapshot"])
 
-    def save_snapshot(self, path: Union[str, os.PathLike[str]], name: Optional[str] = None) -> str:
+    async def save_snapshot(
+        self, path: Union[str, os.PathLike[str]], name: Optional[str] = None
+    ) -> str:
         """Persists a snapshot to ``path`` so parallel workers can boot from it."""
         params: Dict[str, Any] = {"path": os.fspath(path)}
         if name is not None:
             params["name"] = name
-        res = self._call("cluster.save_snapshot", params)
+        res = await self._call("cluster.save_snapshot", params)
         return str(res["path"])
 
-    def node(self, name: str) -> NodeHandle:
-        """Returns a :class:`NodeHandle` for ``name`` (useful after :meth:`from_snapshot`)."""
-        return NodeHandle(self, name)
-
     @classmethod
-    def from_snapshot(
+    async def from_snapshot(
         cls,
         path: Union[str, os.PathLike[str]],
         *,
@@ -809,7 +851,7 @@ class Cluster:
     ) -> "Cluster":
         """Starts an independent cluster session restored directly from ``path``.
 
-        Safe to call concurrently from many threads or processes sharing the
+        Safe to call concurrently from many tasks or processes sharing the
         same Rewind page store for parallel fan-out from one warm snapshot.
         """
         c = cls(
@@ -821,22 +863,22 @@ class Cluster:
             rewind_bin=rewind_bin,
             socket_path=socket_path,
         )
-        c._connect()
+        await c._connect()
         params: Dict[str, Any] = {"path": os.fspath(path), "echo": echo}
         if name is not None:
             params["name"] = name
         if keyframes is not None:
             params["keyframes"] = keyframes
-        c._call("cluster.start_from_snapshot", params)
+        await c._call("cluster.start_from_snapshot", params)
         c._started = True
         return c
 
     @classmethod
-    def fan_out(
+    async def fan_out(
         cls,
         snapshot_path: Union[str, os.PathLike[str]],
         items: Sequence[T],
-        worker_fn: Callable[["Cluster", T], R],
+        worker_fn: Callable[["Cluster", T], Awaitable[R]],
         *,
         max_workers: Optional[int] = None,
         name_prefix: str = "branch",
@@ -846,35 +888,32 @@ class Cluster:
         cpu: Optional[str] = None,
         rewind_bin: Optional[str] = None,
     ) -> List[Tuple[T, R]]:
-        """Runs ``worker_fn(cluster, item)`` in parallel across ``items``,
+        """Runs ``await worker_fn(cluster, item)`` concurrently across ``items``,
         each starting from its own independent cluster restored from ``snapshot_path``.
         """
         workers = max_workers or min(len(items), os.cpu_count() or 1) or 1
+        sem = asyncio.Semaphore(workers)
 
-        def _run_one(item: T) -> Tuple[T, R]:
-            with cls.from_snapshot(
-                snapshot_path,
-                name=f"{name_prefix}-{item}",
-                keyframes=keyframes,
-                echo=echo,
-                clock=clock,
-                cpu=cpu,
-                rewind_bin=rewind_bin,
-            ) as c:
-                return item, worker_fn(c, item)
+        async def _run_one(item: T) -> Tuple[T, R]:
+            async with sem:
+                c = await cls.from_snapshot(
+                    snapshot_path,
+                    name=f"{name_prefix}-{item}",
+                    keyframes=keyframes,
+                    echo=echo,
+                    clock=clock,
+                    cpu=cpu,
+                    rewind_bin=rewind_bin,
+                )
+                async with c:
+                    return item, await worker_fn(c, item)
 
-        results: Dict[int, Tuple[T, R]] = {}
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_run_one, item): idx for idx, item in enumerate(items)}
-            for fut in as_completed(futs):
-                idx = futs[fut]
-                results[idx] = fut.result()
-        return [results[i] for i in range(len(items))]
+        return list(await asyncio.gather(*(_run_one(item) for item in items)))
 
-    def restore(self, snapshot: str) -> Dict[str, Any]:
-        return self._call("cluster.restore", {"snapshot": snapshot})
+    async def restore(self, snapshot: str) -> Dict[str, Any]:
+        return await self._call("cluster.restore", {"snapshot": snapshot})
 
-    def finish(
+    async def finish(
         self,
         *,
         verdict: Optional[str] = None,
@@ -888,43 +927,49 @@ class Cluster:
             params["verdict"] = verdict
         if reason is not None:
             params["reason"] = reason
-        res = self._call("cluster.finish", params)
+        res = await self._call("cluster.finish", params)
         self._finished = True
         self.result = res
         return res
 
-    def close(self) -> None:
+    async def close(self) -> None:
         self._started = False
         try:
-            if self._wfile is not None:
+            if self._writer is not None:
                 try:
-                    self._call("shutdown")
+                    await self._call("shutdown")
                 except Exception:
                     pass
         finally:
-            if self._sock is not None:
-                self._sock.close()
-                self._sock = None
+            if self._writer is not None:
+                try:
+                    self._writer.close()
+                    if self._proc is None:
+                        await self._writer.wait_closed()
+                except Exception:
+                    pass
+                self._writer = None
             if self._proc is not None:
-                if self._proc.stdin:
-                    self._proc.stdin.close()
-                self._proc.wait(timeout=10)
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    self._proc.kill()
+                    await self._proc.wait()
                 self._proc = None
-            self._rfile = None
-            self._wfile = None
+            self._reader = None
 
-    def __enter__(self) -> "Cluster":
+    async def __aenter__(self) -> "Cluster":
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         try:
             if self._started and not self._finished:
                 if exc is not None:
-                    self.finish(
+                    await self.finish(
                         verdict="failed",
                         reason=f"{exc_type.__name__}: {exc}",
                     )
                 else:
-                    self.finish()
+                    await self.finish()
         finally:
-            self.close()
+            await self.close()

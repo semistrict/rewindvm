@@ -42,6 +42,7 @@ Or explore perturbed schedules/nemesis faults automatically:
     rewind cluster check --schedules 4 --nemesis -- python3 examples/cluster/cassandra_accord.py
 """
 
+import asyncio
 import os
 import sys
 import textwrap
@@ -151,14 +152,14 @@ DRIVER_SCRIPT = Path(__file__).with_name("cassandra_accord_driver.py").read_text
 )
 
 
-def main() -> None:
+async def main() -> None:
     cassandra_pkg = os.environ.get("REWIND_CASSANDRA_PKG", f"{REPO_ROOT}#cassandra6")
     cassandra_erofs = os.environ.get("REWIND_CASSANDRA_EROFS")
     python_erofs = os.environ.get("REWIND_PYTHON_EROFS")
     seeds = "10.0.0.1:7000"
 
     t0 = time.perf_counter()
-    with Cluster(
+    async with Cluster(
         "cassandra6-accord-3node",
         latency_ms=2,
         jitter_us=300,
@@ -219,28 +220,28 @@ def main() -> None:
             **client_kwargs,
         )
 
-        c.start()
+        await c.start()
         try:
             for h in node_handles:
-                h.wait_for(
+                await h.wait_for(
                     "Starting listening for CQL clients",
                     from_start=True,
                     timeout_ms=120_000,
                 )
 
-            client.wait_for("CLUSTER_3_NODES_JOINED", from_start=True, timeout_ms=60_000)
-            client.wait_for("CLUSTER_READY", from_start=True, timeout_ms=60_000)
+            await client.wait_for("CLUSTER_3_NODES_JOINED", from_start=True, timeout_ms=60_000)
+            await client.wait_for("CLUSTER_READY", from_start=True, timeout_ms=60_000)
             t_boot = time.perf_counter()
 
             # Snapshot the warm 3-node Accord cluster (VMs + full virtual switch)
             # so we can branch into multiple mid-flight fault timelines without rebooting!
-            snap_ready = c.snapshot("cluster-ready")
+            snap_ready = await c.snapshot("cluster-ready")
             t_snap = time.perf_counter()
 
             # === Branch A: Mid-flight minority partition + lossy/jittery quorum link + heal ===
-            client.wait_for("STORM_IN_FLIGHT", from_start=True, timeout_ms=60_000)
-            c.partition(["node3"], ["node1", "node2", "client"])
-            c.set_link(
+            await client.wait_for("STORM_IN_FLIGHT", from_start=True, timeout_ms=60_000)
+            await c.partition(["node3"], ["node1", "node2", "client"])
+            await c.set_link(
                 "node1",
                 "node2",
                 latency_ms=8,
@@ -249,9 +250,9 @@ def main() -> None:
                 duplicate_ppm=20_000,
             )
 
-            client.wait_for("STORM_MID", from_start=True, timeout_ms=90_000)
-            c.heal()
-            c.set_link(
+            await client.wait_for("STORM_MID", from_start=True, timeout_ms=90_000)
+            await c.heal()
+            await c.set_link(
                 "node1",
                 "node2",
                 latency_ms=2,
@@ -260,28 +261,28 @@ def main() -> None:
                 duplicate_ppm=0,
             )
 
-            conv_a = client.wait_for("CONVERGENCE", from_start=True, timeout_ms=90_000)
+            conv_a = await client.wait_for("CONVERGENCE", from_start=True, timeout_ms=90_000)
             assert "nodes=3 " in (conv_a.line or ""), f"Branch A expected 3 converged nodes: {conv_a.line}"
-            client.wait_for("ACCORD_ALL_OK", from_start=True, timeout_ms=30_000)
+            await client.wait_for("ACCORD_ALL_OK", from_start=True, timeout_ms=30_000)
             t_branch_a = time.perf_counter()
             print(f"[Branch A] {conv_a.line} ({t_branch_a - t_snap:.2f}s wall)", flush=True)
 
             # === Rewind to `cluster-ready` (zero JVM reboot!) ===
-            c.restore(snap_ready)
+            await c.restore(snap_ready)
             t_restore = time.perf_counter()
 
             # === Branch B: Mid-flight asymmetric partition -> hard crash of node3 ===
-            client.wait_for("STORM_IN_FLIGHT", from_start=True, timeout_ms=60_000)
-            c.partition(["node1"], ["node2"], symmetric=False)
+            await client.wait_for("STORM_IN_FLIGHT", from_start=True, timeout_ms=60_000)
+            await c.partition(["node1"], ["node2"], symmetric=False)
 
-            client.wait_for("STORM_MID", from_start=True, timeout_ms=90_000)
-            c.heal()
-            node_handles[2].crash()
+            await client.wait_for("STORM_MID", from_start=True, timeout_ms=90_000)
+            await c.heal()
+            await node_handles[2].crash()
 
-            conv_b = client.wait_for("CONVERGENCE", from_start=True, timeout_ms=90_000)
+            conv_b = await client.wait_for("CONVERGENCE", from_start=True, timeout_ms=90_000)
             assert "nodes=2 " in (conv_b.line or ""), f"Branch B expected 2 surviving nodes: {conv_b.line}"
-            client.wait_for("ACCORD_ALL_OK", from_start=True, timeout_ms=30_000)
-            res = client.wait_exit(timeout_ms=10_000)
+            await client.wait_for("ACCORD_ALL_OK", from_start=True, timeout_ms=30_000)
+            res = await client.wait_exit(timeout_ms=10_000)
             assert res["exited"] and res["exit_code"] == 0, res
             t_branch_b = time.perf_counter()
             print(
@@ -290,7 +291,7 @@ def main() -> None:
                 flush=True,
             )
 
-            fin = c.finish()
+            fin = await c.finish()
             print(
                 f"recorded cluster {fin['id']} ({fin['verdict']}) "
                 f"at {res['cluster_ns'] / 1e6:.1f}ms virtual time "
@@ -299,7 +300,7 @@ def main() -> None:
             )
         except Exception:
             for h in [*node_handles, client]:
-                all_out = h.logs(stream="output")
+                all_out = await h.logs(stream="output")
                 errs = [l for l in all_out if "ERROR" in l or "Exception" in l or "WARN" in l][-15:]
                 out = all_out[-25:]
                 print(f"\n=== {h.name} errors/warns ===", file=sys.stderr)
@@ -312,4 +313,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

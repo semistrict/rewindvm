@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reactive 3-node distributed TCP cluster driven by the Rewind Python SDK.
+"""Reactive 3-node distributed TCP cluster driven by the async Rewind Python SDK.
 
 Demonstrates:
 - Reactive waiting on guest stdout (`wait_for`) instead of hardcoded sleeps
@@ -9,6 +9,7 @@ Demonstrates:
 - Standalone deterministic replay (`rewind cluster replay <id>`) without Python!
 """
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -18,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 from rewind_cluster import Cluster
 
 
-def main() -> None:
-    with Cluster(
+async def main() -> None:
+    async with Cluster(
         "ping-pong-sdk",
         latency_ms=2,
         jitter_us=200,
@@ -64,49 +65,49 @@ echo "ALL_CHECKS_PASSED"
             role="driver",
         )
 
-        c.start()
+        await c.start()
 
         # 1. Reactively wait for both servers and phase 1 completion.
-        n1.wait_for("READY node1")
-        n2.wait_for("READY node2")
-        p1 = cli.wait_for("PHASE1")
+        await n1.wait_for("READY node1")
+        await n2.wait_for("READY node2")
+        p1 = await cli.wait_for("PHASE1")
         assert p1.line == "PHASE1 n1=hello-from-node1 n2=hello-from-node2", p1.line
 
         # 2. Zero-perturbation live guest file inspection.
-        assert n1.cat("/tmp/reply").strip() == "hello-from-node1"
-        assert any(e["path"] == "reply" for e in n1.files("/tmp"))
+        assert (await n1.cat("/tmp/reply")).strip() == "hello-from-node1"
+        assert any(e["path"] == "reply" for e in await n1.files("/tmp"))
 
         # 3. Snapshot before injecting faults so we can test branching!
-        snap = c.snapshot("after-phase1")
+        snap = await c.snapshot("after-phase1")
 
         # Branch A: isolate node2 instead of node1, verify node2 is blocked.
-        n2.isolate()
-        p2_a = cli.wait_for("PHASE2")
+        await n2.isolate()
+        p2_a = await cli.wait_for("PHASE2")
         assert p2_a.line == "PHASE2 n1=hello-from-node1 n2=blocked", p2_a.line
 
         # Rewind back to `after-phase1` and explore Branch B!
-        c.restore(snap)
+        await c.restore(snap)
 
         # Branch B: isolate node1 + add extra latency on client <-> node2.
-        c.partition(["node1"], ["node2", "client"])
-        c.set_link("client", "node2", latency_ms=10)
-        p2_b = cli.wait_for("PHASE2")
+        await c.partition(["node1"], ["node2", "client"])
+        await c.set_link("client", "node2", latency_ms=10)
+        p2_b = await cli.wait_for("PHASE2")
         assert p2_b.line == "PHASE2 n1=blocked n2=hello-from-node2", p2_b.line
 
         # Heal partition and crash + cold-reboot node2 before phase 3.
-        c.heal()
-        n2.crash()
-        c.advance(ms=150)
-        n2.restart()
-        n2.wait_for("READY node2")
+        await c.heal()
+        await n2.crash()
+        await c.advance(ms=150)
+        await n2.restart()
+        await n2.wait_for("READY node2")
 
-        p3 = cli.wait_for("PHASE3")
+        p3 = await cli.wait_for("PHASE3")
         assert p3.line == "PHASE3 n1=hello-from-node1 n2=hello-from-node2", p3.line
-        cli.wait_for("ALL_CHECKS_PASSED")
-        exit_res = cli.wait_exit()
+        await cli.wait_for("ALL_CHECKS_PASSED")
+        exit_res = await cli.wait_exit()
         assert exit_res["exited"] and exit_res["exit_code"] == 0, exit_res
 
-        res = c.finish()
+        res = await c.finish()
         print(
             f"recorded cluster {res['id']} ({res['verdict']}) "
             f"at {res['outcome']['cluster_ns'] / 1e6:.2f}ms"
@@ -114,4 +115,4 @@ echo "ALL_CHECKS_PASSED"
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

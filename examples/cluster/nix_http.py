@@ -9,6 +9,7 @@ Requires `nix` on PATH. Run with:
     python3 examples/cluster/nix_http.py
 """
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -17,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 from rewind_cluster import Cluster
 
 
-def main() -> None:
-    with Cluster(
+async def main() -> None:
+    async with Cluster(
         "nix-http-demo",
         latency_ms=2,
         jitter_us=200,
@@ -52,27 +53,27 @@ echo "NIX_HTTP_OK"
             packages=["nixpkgs#curl"],
         )
 
-        c.start()
-        srv.wait_for("API_READY")
+        await c.start()
+        await srv.wait_for("API_READY")
 
-        r1 = cli.wait_for("R1=")
+        r1 = await cli.wait_for("R1=")
         assert r1.line == "R1=hello-from-nix", r1.line
-        assert srv.cat("/build/greeting.txt").strip() == "hello-from-nix"
+        assert (await srv.cat("/build/greeting.txt")).strip() == "hello-from-nix"
 
-        c.partition(["api"], ["client"])
-        r2 = cli.wait_for("R2=")
+        await c.partition(["api"], ["client"])
+        r2 = await cli.wait_for("R2=")
         assert r2.line == "R2=blocked", r2.line
 
-        c.heal()
-        r3 = cli.wait_for("R3=")
+        await c.heal()
+        r3 = await cli.wait_for("R3=")
         assert r3.line == "R3=hello-from-nix", r3.line
 
-        cli.wait_for("NIX_HTTP_OK")
-        res = cli.wait_exit()
+        await cli.wait_for("NIX_HTTP_OK")
+        res = await cli.wait_exit()
         assert res["exited"] and res["exit_code"] == 0, res
-        fin = c.finish()
+        fin = await c.finish()
         print(f"recorded cluster {fin['id']} ({fin['verdict']})")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
