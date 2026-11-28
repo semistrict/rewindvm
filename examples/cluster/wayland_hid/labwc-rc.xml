@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<labwc_config>
+  <windowRules>
+    <windowRule identifier="*">
+      <action name="Maximize" />
+      <action name="ToggleDecorations" />
+    </windowRule>
+  </windowRules>
+</labwc_config>
