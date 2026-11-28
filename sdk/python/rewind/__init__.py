@@ -20,6 +20,7 @@ Example::
     asyncio.run(main())
 """
 
+from . import guest
 from .cluster import Cluster
 from .hid import (
     ABS_X,
@@ -53,6 +54,7 @@ __all__ = [
     "SignalEvent",
     "WaitAnyResult",
     "WaitResult",
+    "guest",
     "EV_SYN",
     "EV_KEY",
     "EV_REL",

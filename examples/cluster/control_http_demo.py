@@ -17,13 +17,20 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
+SDK_DIR = Path(__file__).resolve().parents[2] / "sdk" / "python"
+sys.path.insert(0, str(SDK_DIR))
 
 from rewind import Cluster
 
-NODE_SCRIPT = (Path(__file__).with_name("control_http") / "node.py").read_text(
-    encoding="utf-8"
-)
+GUEST_DIR = Path(__file__).with_name("control_http")
+NODE_SCRIPT = (GUEST_DIR / "node.py").read_text(encoding="utf-8")
+
+
+def guest_files() -> dict[str, str]:
+    files = {"/build/node.py": NODE_SCRIPT}
+    for py in sorted((SDK_DIR / "rewind").glob("*.py")):
+        files[f"/build/rewind__{py.name}"] = py.read_text(encoding="utf-8")
+    return files
 
 
 async def main() -> None:
@@ -39,13 +46,14 @@ async def main() -> None:
         max_virtual_ms=30_000,
         slice_us=250,
     ) as c:
+        files = guest_files()
         for i in range(1, 4):
             c.add_node(
                 f"n{i}",
                 ["python3", "-u", "/build/node.py"],
                 ip=f"10.0.0.{i}",
                 role="driver",
-                files={"/build/node.py": NODE_SCRIPT},
+                files=files,
                 **node_kwargs,
             )
 

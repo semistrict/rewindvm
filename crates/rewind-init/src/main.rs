@@ -172,6 +172,10 @@ fn run() -> Result<()> {
     let (uid, gid) = job.host_ids();
     for f in &job.files {
         let path = within(root, &f.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("creating parent dir for {}: {e}", f.path))?;
+        }
         fs::write(&path, &f.contents).map_err(|e| format!("writing {}: {e}", f.path))?;
         chown(&path.to_string_lossy(), uid, gid)?;
     }

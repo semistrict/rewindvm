@@ -1,45 +1,37 @@
 #!/usr/bin/env python3
-"""Guest workload demonstrating `http://rewind` coordination (/meta, /signal, /barrier)."""
+"""Guest workload using the Rewind SDK (`from rewind.guest import meta, signal, barrier`)."""
 
-import json
-import urllib.request
+import asyncio
+import sys
+from pathlib import Path
 
-BASE = "http://rewind"
+BUILD_DIR = Path(__file__).resolve().parent
+PKG_DIR = BUILD_DIR / "rewind"
+if not PKG_DIR.exists():
+    PKG_DIR.mkdir(exist_ok=True)
+    for src in BUILD_DIR.glob("rewind__*.py"):
+        (PKG_DIR / src.name.removeprefix("rewind__")).write_bytes(src.read_bytes())
+sys.path.insert(0, str(BUILD_DIR))
 
-
-def http_get(path: str) -> str:
-    with urllib.request.urlopen(f"{BASE}{path}", timeout=30.0) as resp:
-        return resp.read().decode("utf-8")
-
-
-def http_post(path: str, payload: dict) -> str:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{BASE}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30.0) as resp:
-        return resp.read().decode("utf-8")
+from rewind.guest import barrier, meta, signal
 
 
-def main() -> None:
-    meta = json.loads(http_get("/meta"))
-    name = meta["node"]
-    ip = meta["ip"]
-    print(f"META node={name} ip={ip} peers={len(meta['nodes'])}", flush=True)
+async def main() -> None:
+    info = await meta()
+    name = info["node"]
+    ip = info["ip"]
+    print(f"META node={name} ip={ip} peers={len(info['nodes'])}", flush=True)
 
     # 1. One-way signal with structured JSON payload.
-    http_post("/signal/ready", {"node": name, "ip": ip})
+    await signal("ready", {"node": name, "ip": ip})
 
-    # 2. Synchronous barrier: blocks until host releases with a command payload!
-    cmd = http_get("/barrier/dispatch").strip()
+    # 2. Synchronous barrier: blocks until host calls `await c.release("dispatch", ...)`.
+    cmd = (await barrier("dispatch")).strip()
     print(f"DISPATCHED node={name} cmd={cmd}", flush=True)
 
     # 3. Signal completion with the command we executed.
-    http_post("/signal/done", {"node": name, "cmd": cmd})
+    await signal("done", {"node": name, "cmd": cmd})
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
