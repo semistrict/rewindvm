@@ -8,8 +8,8 @@ Intended to be imported from *inside* a guest VM running in a Rewind cluster::
     async def main() -> None:
         info = await meta()
         await signal("ready", {"node": info["node"], "ip": info["ip"]})
-        cmd = await barrier("dispatch")
-        await signal("done", {"cmd": cmd})
+        task = await barrier("dispatch")
+        await signal("done", {"cmd": task["cmd"]})
 
     asyncio.run(main())
 """
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 from .types import ClusterError
@@ -36,6 +36,17 @@ def _encode_payload(payload: Any) -> Tuple[bytes, str]:
     return json.dumps(payload).encode("utf-8"), "application/json"
 
 
+def _decode_response_body(content_type: str, body: bytes) -> Any:
+    ctype = content_type.split(";", 1)[0].strip().lower()
+    if ctype == "application/x-rewind-empty" and not body:
+        return None
+    if ctype == "application/json":
+        return json.loads(body.decode("utf-8"))
+    if ctype == "application/octet-stream":
+        return body
+    return body.decode("utf-8", errors="replace")
+
+
 async def _http_request(
     base_url: str,
     method: str,
@@ -44,14 +55,14 @@ async def _http_request(
     body: bytes = b"",
     content_type: str = "text/plain; charset=utf-8",
     timeout: Optional[float] = 30.0,
-) -> Tuple[int, bytes]:
+) -> Tuple[int, Dict[str, str], bytes]:
     parsed = urlsplit(base_url)
     host = parsed.hostname or "rewind"
     port = parsed.port or 80
     prefix = parsed.path.rstrip("/")
     target = f"{prefix}{path}"
 
-    async def _exchange() -> Tuple[int, bytes]:
+    async def _exchange() -> Tuple[int, Dict[str, str], bytes]:
         reader, writer = await asyncio.open_connection(host, port)
         try:
             headers = [
@@ -81,12 +92,17 @@ async def _http_request(
             )
         head = raw_resp[:sep].decode("iso-8859-1")
         resp_body = raw_resp[sep + 4 :]
-        status_line = head.split("\r\n", 1)[0]
-        parts = status_line.split(" ", 2)
+        lines = head.split("\r\n")
+        parts = lines[0].split(" ", 2)
         if len(parts) < 2:
-            raise ClusterError(f"invalid HTTP status line: {status_line!r}")
+            raise ClusterError(f"invalid HTTP status line: {lines[0]!r}")
         status = int(parts[1])
-        return status, resp_body
+        resp_headers: Dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                resp_headers[k.strip().lower()] = v.strip()
+        return status, resp_headers, resp_body
 
     if timeout is None:
         return await _exchange()
@@ -101,7 +117,7 @@ class GuestClient:
 
     async def meta(self, *, timeout: float = 30.0) -> Dict[str, Any]:
         """Fetches this node's identity and cluster peer list from ``GET /meta``."""
-        status, body = await _http_request(
+        status, _, body = await _http_request(
             self.base_url, "GET", "/meta", timeout=timeout
         )
         if status != 200:
@@ -120,7 +136,7 @@ class GuestClient:
         """Emits a one-way signal via ``POST /signal/<name>``."""
         data, ctype = _encode_payload(payload)
         encoded = quote(name, safe="")
-        status, body = await _http_request(
+        status, _, body = await _http_request(
             self.base_url,
             "POST",
             f"/signal/{encoded}",
@@ -135,18 +151,23 @@ class GuestClient:
             )
         return json.loads(body.decode("utf-8"))
 
-    async def barrier_bytes(
+    async def barrier(
         self,
         name: str,
         payload: Any = None,
         *,
         timeout: Optional[float] = None,
-    ) -> bytes:
-        """Blocks on ``/barrier/<name>`` until the host calls ``release(name, body)``."""
+    ) -> Any:
+        """Blocks on ``/barrier/<name>`` until the host calls ``release(name, body)``.
+
+        Decodes the host's response automatically based on ``Content-Type``
+        (``application/json`` -> parsed JSON, ``application/octet-stream`` ->
+        ``bytes``, empty release -> ``None``, otherwise UTF-8 ``str``).
+        """
         data, ctype = _encode_payload(payload)
         method = "POST" if data else "GET"
         encoded = quote(name, safe="")
-        status, body = await _http_request(
+        status, headers, body = await _http_request(
             self.base_url,
             method,
             f"/barrier/{encoded}",
@@ -159,29 +180,7 @@ class GuestClient:
                 f"{method} /barrier/{name} failed ({status}): "
                 f"{body.decode('utf-8', errors='replace')}"
             )
-        return body
-
-    async def barrier(
-        self,
-        name: str,
-        payload: Any = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> str:
-        """Blocks on ``/barrier/<name>`` and decodes the host release body as UTF-8."""
-        raw = await self.barrier_bytes(name, payload, timeout=timeout)
-        return raw.decode("utf-8", errors="replace")
-
-    async def barrier_json(
-        self,
-        name: str,
-        payload: Any = None,
-        *,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """Blocks on ``/barrier/<name>`` and parses the host release body as JSON."""
-        text = await self.barrier(name, payload, timeout=timeout)
-        return json.loads(text)
+        return _decode_response_body(headers.get("content-type", ""), body)
 
 
 async def meta(
@@ -202,34 +201,12 @@ async def signal(
     return await GuestClient(base_url).signal(name, payload, timeout=timeout)
 
 
-async def barrier_bytes(
-    name: str,
-    payload: Any = None,
-    *,
-    base_url: str = DEFAULT_CONTROL_URL,
-    timeout: Optional[float] = None,
-) -> bytes:
-    """Blocks inside a guest on ``http://rewind/barrier/<name>`` until host release."""
-    return await GuestClient(base_url).barrier_bytes(name, payload, timeout=timeout)
-
-
 async def barrier(
     name: str,
     payload: Any = None,
     *,
     base_url: str = DEFAULT_CONTROL_URL,
     timeout: Optional[float] = None,
-) -> str:
+) -> Any:
     """Blocks inside a guest on ``http://rewind/barrier/<name>`` until host release."""
     return await GuestClient(base_url).barrier(name, payload, timeout=timeout)
-
-
-async def barrier_json(
-    name: str,
-    payload: Any = None,
-    *,
-    base_url: str = DEFAULT_CONTROL_URL,
-    timeout: Optional[float] = None,
-) -> Any:
-    """Blocks inside a guest on ``http://rewind/barrier/<name>`` and parses JSON."""
-    return await GuestClient(base_url).barrier_json(name, payload, timeout=timeout)

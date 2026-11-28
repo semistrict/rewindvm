@@ -73,7 +73,7 @@ class NodeHandle:
     async def release(
         self,
         name: str,
-        body: Any = "",
+        body: Any = None,
         *,
         status: int = 200,
     ) -> Dict[str, Any]:

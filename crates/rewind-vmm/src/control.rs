@@ -227,6 +227,7 @@ impl ControlPlane {
         name: &str,
         target_node: Option<usize>,
         status: u16,
+        content_type: &str,
         body: &[u8],
     ) -> ControlOutput {
         let mut out = ControlOutput::default();
@@ -249,7 +250,7 @@ impl ControlPlane {
             .collect();
 
         for key in matching_keys {
-            let resp = format_http_response(status, "text/plain; charset=utf-8", body);
+            let resp = format_http_response(status, content_type, body);
             let mut frames_to_push = Vec::new();
             let base_ns;
             if let Some(conn) = self.state.conns.get_mut(&key) {
@@ -1175,13 +1176,27 @@ mod tests {
 
         // Snapshot while waiting at barrier, then restore & release two branches!
         let snap = cp.snapshot();
-        let rel_a = cp.release_barrier(6_000, "ready", None, 200, b"branch-A");
+        let rel_a = cp.release_barrier(
+            6_000,
+            "ready",
+            None,
+            200,
+            "text/plain; charset=utf-8",
+            b"branch-A",
+        );
         assert_eq!(rel_a.released, 1);
         let (body_a, _, _) = tcp_payload_from_frame(&rel_a.frames[0].2);
         assert!(String::from_utf8_lossy(body_a).ends_with("\r\n\r\nbranch-A"));
 
         let mut cp_b = ControlPlane::restore(Some(ctrl_ip), nodes, snap);
-        let rel_b = cp_b.release_barrier(6_000, "ready", Some(0), 200, b"branch-B");
+        let rel_b = cp_b.release_barrier(
+            6_000,
+            "ready",
+            Some(0),
+            200,
+            "text/plain; charset=utf-8",
+            b"branch-B",
+        );
         assert_eq!(rel_b.released, 1);
         let (body_b, _, _) = tcp_payload_from_frame(&rel_b.frames[0].2);
         assert!(String::from_utf8_lossy(body_b).ends_with("\r\n\r\nbranch-B"));

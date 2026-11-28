@@ -445,6 +445,7 @@ fn dispatch(
                 name: String,
                 node: Option<String>,
                 status: Option<u16>,
+                content_type: Option<String>,
                 body: Option<String>,
                 body_base64: Option<String>,
             }
@@ -462,7 +463,8 @@ fn dispatch(
             };
             let status = p.status.unwrap_or(200);
             let s = require_session(session)?;
-            let released = s.release_barrier(&p.name, p.node.as_deref(), status, body)?;
+            let released =
+                s.release_barrier(&p.name, p.node.as_deref(), status, p.content_type, body)?;
             let st = s.status();
             Ok(json!({
                 "cluster_ns": st.cluster_ns,

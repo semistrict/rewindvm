@@ -106,6 +106,8 @@ pub enum FaultKind {
         node: Option<usize>,
         #[serde(default = "default_http_ok")]
         status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
         #[serde(default)]
         body: Vec<u8>,
     },
@@ -1115,11 +1117,15 @@ impl NetSwitch {
                 name,
                 node,
                 status,
+                content_type,
                 body,
             } => {
+                let ctype = content_type
+                    .as_deref()
+                    .unwrap_or("text/plain; charset=utf-8");
                 let out = self
                     .control
-                    .release_barrier(at_ns, name, *node, *status, body);
+                    .release_barrier(at_ns, name, *node, *status, ctype, body);
                 self.last_control_released = out.released;
                 self.enqueue_control_frames(out.frames);
             }

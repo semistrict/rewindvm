@@ -1480,6 +1480,7 @@ impl ClusterSession {
         name: &str,
         node: Option<&str>,
         status: u16,
+        content_type: Option<String>,
         body: Vec<u8>,
     ) -> Result<usize> {
         let node_idx = match node {
@@ -1490,6 +1491,7 @@ impl ClusterSession {
             name: name.to_string(),
             node: node_idx,
             status,
+            content_type,
             body,
         })?;
         Ok(self.cluster.last_control_released())

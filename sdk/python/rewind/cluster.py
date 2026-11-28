@@ -385,27 +385,35 @@ class Cluster:
     async def release(
         self,
         name: str,
-        body: Any = "",
+        body: Any = None,
         *,
         node: Optional[str] = None,
         status: int = 200,
     ) -> Dict[str, Any]:
-        """Releases guests blocked on ``http://rewind/barrier/<name>`` with HTTP ``body``.
+        """Releases guests blocked on ``http://rewind/barrier/<name>`` with ``body``.
 
-        ``body`` may be ``str``, ``bytes``, ``None`` (empty), or any JSON-serializable
-        object (``dict``, ``list``, etc.), which is automatically JSON-encoded.
+        The HTTP ``Content-Type`` header matches the Python type so the guest's
+        ``await barrier(name)`` decodes it symmetrically:
+        - ``None``  -> empty body (``await barrier(...)`` returns ``None``)
+        - ``str``   -> ``text/plain; charset=utf-8`` (returns ``str``)
+        - ``bytes`` -> ``application/octet-stream`` (returns ``bytes``)
+        - other     -> ``application/json`` (returns parsed JSON object)
         """
         params: Dict[str, Any] = {"name": name, "status": status}
         if node is not None:
             params["node"] = node
         if body is None:
             params["body"] = ""
+            params["content_type"] = "application/x-rewind-empty"
         elif isinstance(body, bytes):
             params["body_base64"] = base64.b64encode(body).decode("ascii")
+            params["content_type"] = "application/octet-stream"
         elif isinstance(body, str):
             params["body"] = body
+            params["content_type"] = "text/plain; charset=utf-8"
         else:
             params["body"] = json.dumps(body)
+            params["content_type"] = "application/json"
         return await self._rpc.call("cluster.release", params)
 
     async def signals(self, *, since: int = 0) -> List[SignalEvent]:
