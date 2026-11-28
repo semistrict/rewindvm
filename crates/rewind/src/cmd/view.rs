@@ -25,16 +25,43 @@ pub(crate) struct OpenArgs {
     /// beside a failing one.
     #[arg(long, value_name = "RUN")]
     pub(crate) compare: Option<String>,
+    /// Select a node inside a multi-node cluster run.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) node: Option<String>,
 }
 
 pub(crate) fn open(home: &Home, args: OpenArgs) -> Result<ExitCode> {
-    let OpenArgs { run, step, compare } = args;
+    let OpenArgs {
+        run,
+        step,
+        compare,
+        node,
+    } = args;
     use std::os::unix::process::CommandExt;
-    let run = Run::find(home, &run)?;
-    let step = step.map(|s| run.check_step(s)).transpose()?;
-    let compare = compare.map(|c| Run::find(home, &c)).transpose()?;
+    let (target_dir, step) = if let Some(node_name) = node.as_deref() {
+        let resolved = crate::cmd::cluster::resolve_run_or_node(home, &run, Some(node_name))?;
+        let step = step.map(|s| resolved.check_step(s)).transpose()?;
+        (resolved.dir, step)
+    } else if let Ok(single) = Run::find(home, &run) {
+        let step = step.map(|s| single.check_step(s)).transpose()?;
+        (single.dir, step)
+    } else if let Ok(cluster) = rewind_core::cluster::ClusterRun::find(home, &run) {
+        (cluster.dir, step)
+    } else {
+        // Fall through to Run::find's clear error message.
+        let single = Run::find(home, &run)?;
+        let step = step.map(|s| single.check_step(s)).transpose()?;
+        (single.dir, step)
+    };
+    let compare_dir = match compare.as_deref() {
+        None => None,
+        Some(c) => {
+            let resolved = crate::cmd::cluster::resolve_run_or_node(home, c, node.as_deref())?;
+            Some(resolved.dir)
+        }
+    };
     let program = std::env::var_os(APP_ENV).unwrap_or_else(|| APP_PROGRAM.into());
-    let args = app_args(&run.dir, step, compare.as_ref().map(|c| c.dir.as_path()));
+    let args = app_args(&target_dir, step, compare_dir.as_deref());
 
     // exec only returns when the app did not start.
     let e = std::process::Command::new(&program).args(args).exec();
