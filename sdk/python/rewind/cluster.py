@@ -62,6 +62,7 @@ class Cluster:
         fault_window_until_ms: Optional[int] = None,
         nemesis: Optional[Union[Nemesis, Dict[str, Any]]] = None,
         nemesis_enabled: Optional[bool] = None,
+        buggify: Optional[bool] = None,
         keyframes: Optional[bool] = None,
         echo: bool = False,
         wall_timeout_ms: Optional[int] = None,
@@ -99,6 +100,7 @@ class Cluster:
         self._fault_window_until_ms = fault_window_until_ms
         self._nemesis = nemesis.to_dict() if isinstance(nemesis, Nemesis) else nemesis
         self._nemesis_enabled = nemesis_enabled
+        self._buggify = buggify
         self._keyframes = keyframes
         self._echo = echo
         self._wall_timeout_ms = wall_timeout_ms
@@ -122,6 +124,9 @@ class Cluster:
         *,
         ip: Optional[str] = None,
         role: str = "service",
+        zone: Optional[str] = None,
+        rack: Optional[str] = None,
+        dc: Optional[str] = None,
         root: Optional[str] = None,
         packages: Optional[Sequence[str]] = None,
         env: Optional[Union[Dict[str, str], Sequence[str]]] = None,
@@ -160,6 +165,12 @@ class Cluster:
         }
         if ip is not None:
             node["ip"] = ip
+        if zone is not None:
+            node["zone"] = zone
+        if rack is not None:
+            node["rack"] = rack
+        if dc is not None:
+            node["dc"] = dc
         if root is not None:
             node["root"] = root
         if packages is not None:
@@ -249,6 +260,8 @@ class Cluster:
             params["nemesis"] = self._nemesis
         if self._nemesis_enabled is not None:
             params["nemesis_enabled"] = self._nemesis_enabled
+        if self._buggify is not None:
+            params["buggify"] = self._buggify
         if self._keyframes is not None:
             params["keyframes"] = self._keyframes
         if self._wall_timeout_ms is not None:
@@ -467,6 +480,183 @@ class Cluster:
 
     async def restart(self, node: str) -> Dict[str, Any]:
         return await self._rpc.call("cluster.restart", {"node": node})
+
+    async def clog_link(
+        self,
+        src: str,
+        dst: str,
+        *,
+        duration_ms: Optional[int] = None,
+        duration_us: Optional[int] = None,
+        duration_ns: Optional[int] = None,
+        bidirectional: bool = True,
+    ) -> Dict[str, Any]:
+        """Delays (clogs) packets on ``src -> dst`` (and optionally ``dst -> src``)
+        without dropping them; queued frames burst when the clog expires or
+        :meth:`unclog_link` is called."""
+        params: Dict[str, Any] = {
+            "from": src,
+            "to": dst,
+            "bidirectional": bidirectional,
+        }
+        if duration_ms is not None:
+            params["duration_ms"] = duration_ms
+        if duration_us is not None:
+            params["duration_us"] = duration_us
+        if duration_ns is not None:
+            params["duration_ns"] = duration_ns
+        return await self._rpc.call("cluster.clog_link", params)
+
+    async def unclog_link(
+        self, src: str, dst: str, *, bidirectional: bool = True
+    ) -> Dict[str, Any]:
+        """Immediately unclogs ``src -> dst`` (and optionally ``dst -> src``)."""
+        return await self._rpc.call(
+            "cluster.unclog_link",
+            {"from": src, "to": dst, "bidirectional": bidirectional},
+        )
+
+    async def clog_node(
+        self,
+        node: str,
+        *,
+        duration_ms: Optional[int] = None,
+        duration_us: Optional[int] = None,
+        duration_ns: Optional[int] = None,
+        mode: str = "all",
+    ) -> Dict[str, Any]:
+        """Delays (clogs) packets sent and/or received by ``node`` (``mode``: ``'all'``, ``'send'``, ``'recv'``)."""
+        params: Dict[str, Any] = {"node": node, "mode": mode}
+        if duration_ms is not None:
+            params["duration_ms"] = duration_ms
+        if duration_us is not None:
+            params["duration_us"] = duration_us
+        if duration_ns is not None:
+            params["duration_ns"] = duration_ns
+        return await self._rpc.call("cluster.clog_node", params)
+
+    async def unclog(self, node: Optional[str] = None) -> Dict[str, Any]:
+        """Immediately unclogs ``node`` (or all active clogs when ``node`` is ``None``)."""
+        params: Dict[str, Any] = {}
+        if node is not None:
+            params["node"] = node
+        return await self._rpc.call("cluster.unclog", params)
+
+    async def pause(self, node: str) -> Dict[str, Any]:
+        """Freezes ``node``'s vCPU (GC / hypervisor stall) while queueing inbound packets."""
+        return await self._rpc.call("cluster.pause", {"node": node})
+
+    async def resume(self, node: str) -> Dict[str, Any]:
+        """Resumes a previously paused ``node`` and drains queued packets."""
+        return await self._rpc.call("cluster.resume", {"node": node})
+
+    async def step_clock(
+        self,
+        node: str,
+        *,
+        delta_ms: Optional[int] = None,
+        delta_us: Optional[int] = None,
+        delta_ns: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Steps ``node``'s monotonic virtual clock forward immediately."""
+        params: Dict[str, Any] = {"node": node}
+        if delta_ms is not None:
+            params["delta_ms"] = delta_ms
+        if delta_us is not None:
+            params["delta_us"] = delta_us
+        if delta_ns is not None:
+            params["delta_ns"] = delta_ns
+        return await self._rpc.call("cluster.step_clock", params)
+
+    async def set_clock_drift(self, node: str, drift_ppm: int) -> Dict[str, Any]:
+        """Updates ``node``'s virtual clock rate drift (ppm) dynamically."""
+        return await self._rpc.call(
+            "cluster.set_clock_drift", {"node": node, "drift_ppm": drift_ppm}
+        )
+
+    async def set_nemesis(self, enabled: bool) -> Dict[str, Any]:
+        """Enables or disables the automatic nemesis (quiet / settle phase)."""
+        return await self._rpc.call("cluster.set_nemesis", {"enabled": bool(enabled)})
+
+    async def set_buggify(self, enabled: bool) -> Dict[str, Any]:
+        """Enables or disables ``http://rewind/buggify/<name>`` fault injection."""
+        return await self._rpc.call("cluster.set_buggify", {"enabled": bool(enabled)})
+
+    async def probes(self, cluster: Optional[str] = None) -> Dict[str, int]:
+        """Returns cumulative hit counts for every ``http://rewind/probe/<name>`` hit."""
+        params: Dict[str, Any] = {}
+        if cluster is not None:
+            params["cluster"] = cluster
+        res = await self._rpc.call("cluster.probes", params)
+        return {str(k): int(v) for k, v in (res.get("probes") or {}).items()}
+
+    async def buggify_sites(self, cluster: Optional[str] = None) -> Dict[str, bool]:
+        """Returns activation decisions for every ``http://rewind/buggify/<name>`` site hit."""
+        params: Dict[str, Any] = {}
+        if cluster is not None:
+            params["cluster"] = cluster
+        res = await self._rpc.call("cluster.buggify_sites", params)
+        return {str(k): bool(v) for k, v in (res.get("sites") or {}).items()}
+
+    async def nodes_in(
+        self,
+        *,
+        zone: Optional[str] = None,
+        rack: Optional[str] = None,
+        dc: Optional[str] = None,
+    ) -> List[str]:
+        """Returns node names matching the given locality filter (``zone``, ``rack``, ``dc``)."""
+        if self._started:
+            nodes_info = (await self.status()).get("nodes", [])
+        else:
+            nodes_info = self._nodes
+        out: List[str] = []
+        for n in nodes_info:
+            if zone is not None and n.get("zone") != zone:
+                continue
+            if rack is not None and n.get("rack") != rack:
+                continue
+            if dc is not None and n.get("dc") != dc:
+                continue
+            out.append(str(n["name"]))
+        return out
+
+    async def partition_zone(
+        self, zone: str, *, symmetric: bool = True
+    ) -> Dict[str, Any]:
+        """Isolates every node in ``zone`` from all nodes outside ``zone``."""
+        members = await self.nodes_in(zone=zone)
+        if not members:
+            raise ClusterError(f"no nodes in zone {zone!r}")
+        return await self.partition(members, None, symmetric=symmetric)
+
+    async def crash_zone(self, zone: str) -> List[Dict[str, Any]]:
+        """Hard-crashes every node in ``zone`` in deterministic order."""
+        members = await self.nodes_in(zone=zone)
+        if not members:
+            raise ClusterError(f"no nodes in zone {zone!r}")
+        return [await self.crash(name) for name in members]
+
+    async def restart_zone(self, zone: str) -> List[Dict[str, Any]]:
+        """Cold-reboots every node in ``zone`` in deterministic order."""
+        members = await self.nodes_in(zone=zone)
+        if not members:
+            raise ClusterError(f"no nodes in zone {zone!r}")
+        return [await self.restart(name) for name in members]
+
+    async def pause_zone(self, zone: str) -> List[Dict[str, Any]]:
+        """Pauses every node in ``zone`` in deterministic order."""
+        members = await self.nodes_in(zone=zone)
+        if not members:
+            raise ClusterError(f"no nodes in zone {zone!r}")
+        return [await self.pause(name) for name in members]
+
+    async def resume_zone(self, zone: str) -> List[Dict[str, Any]]:
+        """Resumes every node in ``zone`` in deterministic order."""
+        members = await self.nodes_in(zone=zone)
+        if not members:
+            raise ClusterError(f"no nodes in zone {zone!r}")
+        return [await self.resume(name) for name in members]
 
     async def send_input(self, node: str, data: Union[str, bytes]) -> Dict[str, Any]:
         """Injects deterministic console input into ``node``'s ``/dev/rewind-console``."""
@@ -793,6 +983,7 @@ class Cluster:
         cores: Optional[int] = None,
         max_virtual_ms: Optional[int] = None,
         nemesis_enabled: Optional[bool] = None,
+        buggify: Optional[bool] = None,
         keyframes: Optional[bool] = None,
         echo: bool = False,
         wall_timeout_ms: Optional[int] = None,
@@ -813,6 +1004,8 @@ class Cluster:
             params["max_virtual_ms"] = max_virtual_ms
         if nemesis_enabled is not None:
             params["nemesis_enabled"] = nemesis_enabled
+        if buggify is not None:
+            params["buggify"] = buggify
         if keyframes is not None:
             params["keyframes"] = keyframes
         if wall_timeout_ms is not None:

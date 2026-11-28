@@ -77,6 +77,54 @@ class NodeHandle:
     async def restart(self) -> Dict[str, Any]:
         return await self._cluster.restart(self.name)
 
+    async def clog(
+        self,
+        *,
+        duration_ms: Optional[int] = None,
+        duration_us: Optional[int] = None,
+        duration_ns: Optional[int] = None,
+        mode: str = "all",
+    ) -> Dict[str, Any]:
+        """Delays (clogs) packets sent and/or received by this node without dropping them."""
+        return await self._cluster.clog_node(
+            self.name,
+            duration_ms=duration_ms,
+            duration_us=duration_us,
+            duration_ns=duration_ns,
+            mode=mode,
+        )
+
+    async def unclog(self) -> Dict[str, Any]:
+        """Immediately unclogs all clogs involving this node."""
+        return await self._cluster.unclog(self.name)
+
+    async def pause(self) -> Dict[str, Any]:
+        """Freezes this node's vCPU while queueing inbound packets until :meth:`resume`."""
+        return await self._cluster.pause(self.name)
+
+    async def resume(self) -> Dict[str, Any]:
+        """Resumes this node after :meth:`pause`."""
+        return await self._cluster.resume(self.name)
+
+    async def step_clock(
+        self,
+        *,
+        delta_ms: Optional[int] = None,
+        delta_us: Optional[int] = None,
+        delta_ns: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Steps this node's monotonic virtual clock forward immediately."""
+        return await self._cluster.step_clock(
+            self.name,
+            delta_ms=delta_ms,
+            delta_us=delta_us,
+            delta_ns=delta_ns,
+        )
+
+    async def set_clock_drift(self, drift_ppm: int) -> Dict[str, Any]:
+        """Updates this node's virtual clock rate drift (ppm) dynamically."""
+        return await self._cluster.set_clock_drift(self.name, drift_ppm)
+
     async def send_input(self, data: Union[str, bytes]) -> Dict[str, Any]:
         return await self._cluster.send_input(self.name, data)
 

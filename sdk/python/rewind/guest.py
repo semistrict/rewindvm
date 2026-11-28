@@ -182,6 +182,53 @@ class GuestClient:
             )
         return _decode_response_body(headers.get("content-type", ""), body)
 
+    async def buggify(
+        self,
+        name: str,
+        *,
+        p: Optional[float] = None,
+        timeout: float = 30.0,
+    ) -> bool:
+        """Evaluates two-stage deterministic ``GET /buggify/<name>[?p=<0..1>]``.
+
+        Returns ``True`` only when ``buggify`` is enabled for the cluster, this
+        site was activated for the current seed, and this call's deterministic
+        draw fired (default probability 0.25, or ``p`` if specified).
+        """
+        encoded = quote(name, safe="")
+        path = f"/buggify/{encoded}"
+        if p is not None:
+            path += f"?p={float(p):.6f}"
+        status, _, body = await _http_request(
+            self.base_url, "GET", path, timeout=timeout
+        )
+        if status != 200:
+            raise ClusterError(
+                f"GET {path} failed ({status}): {body.decode('utf-8', errors='replace')}"
+            )
+        return bool(json.loads(body.decode("utf-8")).get("fire", False))
+
+    async def probe(
+        self,
+        name: str,
+        *,
+        timeout: float = 30.0,
+    ) -> int:
+        """Records a deterministic coverage hit via ``POST /probe/<name>``.
+
+        Returns the cumulative hit count across the cluster.
+        """
+        encoded = quote(name, safe="")
+        status, _, body = await _http_request(
+            self.base_url, "POST", f"/probe/{encoded}", timeout=timeout
+        )
+        if status != 200:
+            raise ClusterError(
+                f"POST /probe/{name} failed ({status}): "
+                f"{body.decode('utf-8', errors='replace')}"
+            )
+        return int(json.loads(body.decode("utf-8")).get("count", 0))
+
 
 async def meta(
     *, base_url: str = DEFAULT_CONTROL_URL, timeout: float = 30.0
@@ -210,3 +257,24 @@ async def barrier(
 ) -> Any:
     """Blocks inside a guest on ``http://rewind/barrier/<name>`` until host release."""
     return await GuestClient(base_url).barrier(name, payload, timeout=timeout)
+
+
+async def buggify(
+    name: str,
+    *,
+    p: Optional[float] = None,
+    base_url: str = DEFAULT_CONTROL_URL,
+    timeout: float = 30.0,
+) -> bool:
+    """Evaluates a deterministic ``BUGGIFY`` site via ``http://rewind/buggify/<name>``."""
+    return await GuestClient(base_url).buggify(name, p=p, timeout=timeout)
+
+
+async def probe(
+    name: str,
+    *,
+    base_url: str = DEFAULT_CONTROL_URL,
+    timeout: float = 30.0,
+) -> int:
+    """Records a deterministic ``CODE_PROBE`` hit via ``http://rewind/probe/<name>``."""
+    return await GuestClient(base_url).probe(name, timeout=timeout)

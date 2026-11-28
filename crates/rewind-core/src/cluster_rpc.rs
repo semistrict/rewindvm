@@ -27,7 +27,7 @@ use crate::cluster_session::{
 use crate::home::{Guest, Home};
 use crate::inspect::{Inspection, cat_on_machine, list_on_machine};
 use crate::run::{CompareMachine, Keyframes};
-use rewind_vmm::net::NetEvent;
+use rewind_vmm::net::{ClogMode, NetEvent};
 
 /// Server defaults inherited from CLI flags and environment variables (such as
 /// `REWIND_SEED`, `REWIND_SCHEDULE`, `REWIND_NEMESIS`, `REWIND_FAULT_FROM_MS`,
@@ -164,6 +164,7 @@ struct StartParams {
     seed: Option<u64>,
     schedule: Option<u64>,
     nemesis_enabled: Option<bool>,
+    buggify: Option<bool>,
     fault_window_from_ms: Option<u64>,
     fault_window_until_ms: Option<u64>,
     epoch: Option<u64>,
@@ -193,6 +194,9 @@ struct NodeStartParams {
     name: String,
     ip: Option<String>,
     role: Option<String>,
+    zone: Option<String>,
+    rack: Option<String>,
+    dc: Option<String>,
     root: Option<PathBuf>,
     #[serde(default)]
     packages: Vec<String>,
@@ -269,6 +273,9 @@ fn dispatch(
                         name: n.name,
                         ip: n.ip,
                         role: n.role,
+                        zone: n.zone,
+                        rack: n.rack,
+                        dc: n.dc,
                         root: n.root,
                         packages: n.packages,
                         command: n.command,
@@ -295,6 +302,9 @@ fn dispatch(
             let nemesis_enabled = env_bool("REWIND_NEMESIS")
                 .or(p.nemesis_enabled)
                 .unwrap_or(false);
+            let buggify_enabled = env_bool("REWIND_BUGGIFY")
+                .or(p.buggify)
+                .unwrap_or(false);
             let from_ms = env_u64("REWIND_FAULT_FROM_MS").or(p.fault_window_from_ms);
             let until_ms = env_u64("REWIND_FAULT_UNTIL_MS").or(p.fault_window_until_ms);
             let take_kf = env_bool("REWIND_KEYFRAMES")
@@ -313,6 +323,7 @@ fn dispatch(
                 cores_override: None,
                 max_virtual_ms_override: None,
                 nemesis_enabled,
+                buggify_enabled,
                 keyframes: if take_kf {
                     Keyframes::Take
                 } else {
@@ -566,6 +577,232 @@ fn dispatch(
                 "cluster_step": st.cluster_step,
                 "boot_count": boot_count,
             }))
+        }
+        "cluster.clog_link" => {
+            #[derive(Deserialize)]
+            struct P {
+                from: String,
+                to: String,
+                duration_ms: Option<u64>,
+                duration_us: Option<u64>,
+                duration_ns: Option<u64>,
+                #[serde(default = "default_true")]
+                bidirectional: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.clog_link")?;
+            let duration_ns = p
+                .duration_ns
+                .or_else(|| p.duration_us.map(|u| u.saturating_mul(1_000)))
+                .or_else(|| p.duration_ms.map(|m| m.saturating_mul(1_000_000)))
+                .context("cluster.clog_link requires duration_ms, duration_us, or duration_ns")?;
+            let s = require_session(session)?;
+            let until_ns = s.clog_link(&p.from, &p.to, duration_ns, p.bidirectional)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+                "until_ns": until_ns,
+            }))
+        }
+        "cluster.unclog_link" => {
+            #[derive(Deserialize)]
+            struct P {
+                from: String,
+                to: String,
+                #[serde(default = "default_true")]
+                bidirectional: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.unclog_link")?;
+            let s = require_session(session)?;
+            s.unclog_link(&p.from, &p.to, p.bidirectional)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
+        "cluster.clog_node" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                duration_ms: Option<u64>,
+                duration_us: Option<u64>,
+                duration_ns: Option<u64>,
+                #[serde(default)]
+                mode: ClogMode,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.clog_node")?;
+            let duration_ns = p
+                .duration_ns
+                .or_else(|| p.duration_us.map(|u| u.saturating_mul(1_000)))
+                .or_else(|| p.duration_ms.map(|m| m.saturating_mul(1_000_000)))
+                .context("cluster.clog_node requires duration_ms, duration_us, or duration_ns")?;
+            let s = require_session(session)?;
+            let until_ns = s.clog_node(&p.node, duration_ns, p.mode)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+                "until_ns": until_ns,
+            }))
+        }
+        "cluster.unclog" => {
+            #[derive(Deserialize, Default)]
+            struct P {
+                node: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).unwrap_or_default();
+            let s = require_session(session)?;
+            s.unclog(p.node.as_deref())?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
+        "cluster.pause" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+            }
+            let p: P =
+                serde_json::from_value(params).context("invalid params for cluster.pause")?;
+            let s = require_session(session)?;
+            s.pause(&p.node)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
+        "cluster.resume" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+            }
+            let p: P =
+                serde_json::from_value(params).context("invalid params for cluster.resume")?;
+            let s = require_session(session)?;
+            s.resume(&p.node)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
+        "cluster.step_clock" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                delta_ms: Option<u64>,
+                delta_us: Option<u64>,
+                delta_ns: Option<u64>,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.step_clock")?;
+            let delta_ns = p
+                .delta_ns
+                .or_else(|| p.delta_us.map(|u| u.saturating_mul(1_000)))
+                .or_else(|| p.delta_ms.map(|m| m.saturating_mul(1_000_000)))
+                .context("cluster.step_clock requires delta_ms, delta_us, or delta_ns")?;
+            let s = require_session(session)?;
+            s.step_clock(&p.node, delta_ns)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
+        "cluster.set_clock_drift" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                drift_ppm: i32,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.set_clock_drift")?;
+            let s = require_session(session)?;
+            s.set_clock_drift(&p.node, p.drift_ppm)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
+        "cluster.set_nemesis" => {
+            #[derive(Deserialize)]
+            struct P {
+                enabled: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.set_nemesis")?;
+            let s = require_session(session)?;
+            s.set_nemesis(p.enabled)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+                "nemesis_enabled": st.nemesis_enabled,
+            }))
+        }
+        "cluster.set_buggify" => {
+            #[derive(Deserialize)]
+            struct P {
+                enabled: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.set_buggify")?;
+            let s = require_session(session)?;
+            s.set_buggify(p.enabled)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+                "buggify_enabled": st.buggify_enabled,
+            }))
+        }
+        "cluster.probes" => {
+            #[derive(Deserialize, Default)]
+            struct P {
+                #[serde(default)]
+                cluster: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).unwrap_or_default();
+            if p.cluster.is_some() || session.is_none() {
+                let run = resolve_cluster_run(
+                    p.cluster.as_deref(),
+                    last_finished_dir,
+                    defaults,
+                    "cluster.probes",
+                )?;
+                Ok(json!({ "probes": run.manifest.probes }))
+            } else {
+                let s = require_session(session)?;
+                Ok(json!({ "probes": s.probes() }))
+            }
+        }
+        "cluster.buggify_sites" => {
+            #[derive(Deserialize, Default)]
+            struct P {
+                #[serde(default)]
+                cluster: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).unwrap_or_default();
+            if p.cluster.is_some() || session.is_none() {
+                let run = resolve_cluster_run(
+                    p.cluster.as_deref(),
+                    last_finished_dir,
+                    defaults,
+                    "cluster.buggify_sites",
+                )?;
+                Ok(json!({ "sites": run.manifest.buggify_sites }))
+            } else {
+                let s = require_session(session)?;
+                Ok(json!({ "sites": s.buggify_sites() }))
+            }
         }
         "cluster.send_input" => {
             use base64::Engine;
@@ -972,6 +1209,7 @@ fn dispatch(
                 cores: Option<u32>,
                 max_virtual_ms: Option<u64>,
                 nemesis_enabled: Option<bool>,
+                buggify: Option<bool>,
                 keyframes: Option<bool>,
                 #[serde(default)]
                 echo: bool,
@@ -1011,6 +1249,9 @@ fn dispatch(
                 max_virtual_ms_override: p.max_virtual_ms,
                 nemesis_enabled: env_bool("REWIND_NEMESIS")
                     .or(p.nemesis_enabled)
+                    .unwrap_or(false),
+                buggify_enabled: env_bool("REWIND_BUGGIFY")
+                    .or(p.buggify)
                     .unwrap_or(false),
                 keyframes: kf_mode,
                 echo: p.echo,
@@ -1325,7 +1566,15 @@ fn net_event_ns(ev: &NetEvent) -> u64 {
         | NetEvent::Heal { ns }
         | NetEvent::NodeCrash { ns, .. }
         | NetEvent::NodeRestart { ns, .. }
-        | NetEvent::LinkUpdated { ns, .. } => *ns,
+        | NetEvent::LinkUpdated { ns, .. }
+        | NetEvent::Clog { ns, .. }
+        | NetEvent::Unclog { ns, .. }
+        | NetEvent::NodePause { ns, .. }
+        | NetEvent::NodeResume { ns, .. }
+        | NetEvent::ClockStep { ns, .. }
+        | NetEvent::ClockDrift { ns, .. }
+        | NetEvent::NemesisToggled { ns, .. }
+        | NetEvent::BuggifyToggled { ns, .. } => *ns,
     }
 }
 
@@ -1336,8 +1585,19 @@ fn net_event_involves(ev: &NetEvent, node: usize) -> bool {
         | NetEvent::Drop { src, dst, .. }
         | NetEvent::Duplicate { src, dst, .. } => *src == node || *dst == node,
         NetEvent::LinkUpdated { from, to, .. } => *from == node || *to == node,
-        NetEvent::NodeCrash { node: n, .. } | NetEvent::NodeRestart { node: n, .. } => *n == node,
-        NetEvent::Partition { .. } | NetEvent::Heal { .. } => true,
+        NetEvent::Clog { from, to, .. } | NetEvent::Unclog { from, to, .. } => {
+            from.is_none_or(|f| f == node) || to.is_some_and(|t| t == node)
+        }
+        NetEvent::NodeCrash { node: n, .. }
+        | NetEvent::NodeRestart { node: n, .. }
+        | NetEvent::NodePause { node: n, .. }
+        | NetEvent::NodeResume { node: n, .. }
+        | NetEvent::ClockStep { node: n, .. }
+        | NetEvent::ClockDrift { node: n, .. } => *n == node,
+        NetEvent::Partition { .. }
+        | NetEvent::Heal { .. }
+        | NetEvent::NemesisToggled { .. }
+        | NetEvent::BuggifyToggled { .. } => true,
     }
 }
 

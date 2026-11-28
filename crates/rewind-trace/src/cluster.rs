@@ -1,6 +1,7 @@
 //! Cluster manifests, declarative spec files (TOML/JSON), and verdicts for
 //! multi-node Rewind VM runs.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,12 @@ pub struct NemesisSpecFile {
     pub restart_prob_ppm: u32,
     #[serde(default = "default_max_crashed")]
     pub max_crashed: usize,
+    #[serde(default)]
+    pub clog_prob_ppm: u32,
+    #[serde(default)]
+    pub pause_prob_ppm: u32,
+    #[serde(default)]
+    pub protect_nodes: Vec<String>,
 }
 
 fn default_nemesis_tick_ms() -> u64 {
@@ -180,6 +187,13 @@ pub struct NodeSpecFile {
     /// `"service"` (default) or `"driver"`.
     #[serde(default)]
     pub role: Option<String>,
+    /// Optional fault-domain locality tags (mirroring FoundationDB `LocalityData`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dc: Option<String>,
     /// Attach a paravirtual framebuffer (`/dev/fb0`) for deterministic video capture.
     #[serde(default)]
     pub display: bool,
@@ -226,6 +240,10 @@ pub struct ClusterManifest {
     pub outcome: Option<ClusterRunOutcome>,
     pub verdict: ClusterVerdict,
     pub trace_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub probes: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub buggify_sites: BTreeMap<String, bool>,
     pub recorded_by: String,
 }
 
@@ -243,6 +261,12 @@ pub struct ClusterNodeManifest {
     pub ip: String,
     pub mac: [u8; 6],
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dc: Option<String>,
     pub clock_skew_ns: i64,
     pub clock_drift_ppm: i32,
     #[serde(default)]

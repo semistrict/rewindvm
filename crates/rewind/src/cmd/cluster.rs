@@ -101,6 +101,9 @@ pub(crate) struct ClusterCommonArgs {
     /// Enable schedule-driven nemesis (random partitions, heals, node crashes & restarts).
     #[arg(long)]
     pub(crate) nemesis: bool,
+    /// Enable deterministic `http://rewind/buggify/<name>` fault injection.
+    #[arg(long)]
+    pub(crate) buggify: bool,
     /// Host wall-clock timeout in seconds.
     #[arg(long)]
     pub(crate) timeout: Option<u64>,
@@ -150,6 +153,9 @@ pub(crate) struct ClusterCheckArgs {
     /// Enable schedule-driven nemesis on perturbed runs (schedule > 0).
     #[arg(long)]
     pub(crate) nemesis: bool,
+    /// Enable deterministic `http://rewind/buggify/<name>` on perturbed runs (schedule > 0).
+    #[arg(long)]
+    pub(crate) buggify: bool,
     /// Parallel script executions across host cores.
     #[arg(long, short)]
     pub(crate) jobs: Option<usize>,
@@ -419,6 +425,7 @@ fn run_script_trial(
     seed: u64,
     schedule: u64,
     nemesis: bool,
+    buggify: bool,
     from_ms: Option<u64>,
     until_ms: Option<u64>,
     keyframes: bool,
@@ -440,6 +447,7 @@ fn run_script_trial(
         .env("REWIND_SEED", seed.to_string())
         .env("REWIND_SCHEDULE", schedule.to_string())
         .env("REWIND_NEMESIS", if nemesis { "1" } else { "0" })
+        .env("REWIND_BUGGIFY", if buggify { "1" } else { "0" })
         .env("REWIND_KEYFRAMES", if keyframes { "1" } else { "0" })
         .env("REWIND_RESULT_FILE", &result_path)
         .stdin(Stdio::null())
@@ -520,6 +528,7 @@ fn cmd_check(home: &Home, args: ClusterCheckArgs) -> Result<ExitCode> {
         args.seed,
         0,
         false,
+        false,
         None,
         None,
         true,
@@ -545,6 +554,7 @@ fn cmd_check(home: &Home, args: ClusterCheckArgs) -> Result<ExitCode> {
     let cmd_ref: &[String] = &args.command;
     let clock = args.clock;
     let nemesis = args.nemesis;
+    let buggify = args.buggify;
 
     for chunk in work.chunks(workers) {
         let results: Vec<Result<ScriptTrial>> = std::thread::scope(|s| {
@@ -560,6 +570,7 @@ fn cmd_check(home: &Home, args: ClusterCheckArgs) -> Result<ExitCode> {
                             seed,
                             sched,
                             nemesis && sched != 0,
+                            buggify && sched != 0,
                             None,
                             None,
                             false,
@@ -620,6 +631,7 @@ fn cmd_check(home: &Home, args: ClusterCheckArgs) -> Result<ExitCode> {
                                     seed,
                                     sched,
                                     nemesis,
+                                    buggify,
                                     Some(from_ms),
                                     Some(until_ms),
                                     false,
@@ -646,6 +658,7 @@ fn cmd_check(home: &Home, args: ClusterCheckArgs) -> Result<ExitCode> {
             seed,
             sched,
             nemesis,
+            buggify,
             Some(narrowed.from),
             Some(narrowed.until),
             true,
@@ -737,6 +750,7 @@ fn build_options(
         cores_override: common.cores,
         max_virtual_ms_override: common.max_virtual_ms,
         nemesis_enabled: common.nemesis,
+        buggify_enabled: common.buggify,
         keyframes,
         echo,
         wall_timeout: common.timeout.map(Duration::from_secs),
@@ -1009,7 +1023,15 @@ fn net_event_ns(ev: &NetEvent) -> u64 {
         | NetEvent::Heal { ns }
         | NetEvent::NodeCrash { ns, .. }
         | NetEvent::NodeRestart { ns, .. }
-        | NetEvent::LinkUpdated { ns, .. } => *ns,
+        | NetEvent::LinkUpdated { ns, .. }
+        | NetEvent::Clog { ns, .. }
+        | NetEvent::Unclog { ns, .. }
+        | NetEvent::NodePause { ns, .. }
+        | NetEvent::NodeResume { ns, .. }
+        | NetEvent::ClockStep { ns, .. }
+        | NetEvent::ClockDrift { ns, .. }
+        | NetEvent::NemesisToggled { ns, .. }
+        | NetEvent::BuggifyToggled { ns, .. } => *ns,
     }
 }
 
@@ -1020,8 +1042,19 @@ fn net_event_involves(ev: &NetEvent, node: usize) -> bool {
         | NetEvent::Drop { src, dst, .. }
         | NetEvent::Duplicate { src, dst, .. } => *src == node || *dst == node,
         NetEvent::LinkUpdated { from, to, .. } => *from == node || *to == node,
-        NetEvent::NodeCrash { node: n, .. } | NetEvent::NodeRestart { node: n, .. } => *n == node,
-        NetEvent::Partition { .. } | NetEvent::Heal { .. } => true,
+        NetEvent::Clog { from, to, .. } | NetEvent::Unclog { from, to, .. } => {
+            from.is_none_or(|f| f == node) || to.is_some_and(|t| t == node)
+        }
+        NetEvent::NodeCrash { node: n, .. }
+        | NetEvent::NodeRestart { node: n, .. }
+        | NetEvent::NodePause { node: n, .. }
+        | NetEvent::NodeResume { node: n, .. }
+        | NetEvent::ClockStep { node: n, .. }
+        | NetEvent::ClockDrift { node: n, .. } => *n == node,
+        NetEvent::Partition { .. }
+        | NetEvent::Heal { .. }
+        | NetEvent::NemesisToggled { .. }
+        | NetEvent::BuggifyToggled { .. } => true,
     }
 }
 
@@ -1088,6 +1121,14 @@ fn print_cluster_summary(run: &ClusterRun) {
         for r in reasons {
             println!("    - {r}");
         }
+    }
+    if !m.probes.is_empty() {
+        let items: Vec<String> = m
+            .probes
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        println!("  probes:  {}", items.join(", "));
     }
     if let Some(hash) = &m.trace_hash {
         println!("  trace:   {}", &hash[..12.min(hash.len())]);

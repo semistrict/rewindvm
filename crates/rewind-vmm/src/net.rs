@@ -66,6 +66,19 @@ pub struct HidEvent {
     pub value: i32,
 }
 
+/// Direction for node-level network clogging (`FaultKind::ClogNode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClogMode {
+    /// Clog both outbound (`send`) and inbound (`recv`) packets for the node.
+    #[default]
+    All,
+    /// Clog only outbound packets transmitted by the node.
+    Send,
+    /// Clog only inbound packets addressed to the node.
+    Recv,
+}
+
 /// Kinds of scripted or interactive cluster faults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -79,6 +92,29 @@ pub enum FaultKind {
     Heal,
     /// Heals only the listed directed `(src, dst)` links.
     HealLinks { links: Vec<(usize, usize)> },
+    /// Delays (clogs) all packets on directed link `from -> to` until
+    /// `until_ns`, queueing them on the switch instead of dropping them
+    /// (FoundationDB `clogPair` semantics).
+    ClogLink {
+        from: usize,
+        to: usize,
+        until_ns: u64,
+    },
+    /// Immediately unclogs directed link `from -> to` and releases queued
+    /// packets.
+    UnclogLink { from: usize, to: usize },
+    /// Delays (clogs) packets sent by and/or addressed to `node` until
+    /// `until_ns` (FoundationDB `clogInterface` semantics).
+    ClogNode {
+        node: usize,
+        until_ns: u64,
+        #[serde(default)]
+        mode: ClogMode,
+    },
+    /// Immediately unclogs all send/recv/link clogs involving `node`.
+    UnclogNode { node: usize },
+    /// Immediately unclogs all active link and node clogs.
+    UnclogAll,
     /// Dynamically updates link parameters for `(from, to)`.
     SetLink {
         from: usize,
@@ -93,6 +129,19 @@ pub enum FaultKind {
     Crash { node: usize },
     /// Cold reboot of a previously crashed `node`.
     Restart { node: usize },
+    /// Freezes `node`'s vCPU (models GC pauses / hypervisor stalls) while
+    /// queueing inbound packets until resumed.
+    Pause { node: usize },
+    /// Resumes a previously paused `node`.
+    Resume { node: usize },
+    /// Steps `node`'s monotonic virtual clock forward by `delta_ns`.
+    StepClock { node: usize, delta_ns: u64 },
+    /// Dynamically updates `node`'s clock rate drift (`ppm`) from this point on.
+    SetClockDrift { node: usize, drift_ppm: i32 },
+    /// Enables or disables the automatic nemesis (quiet / settle phase).
+    SetNemesis { enabled: bool },
+    /// Enables or disables `http://rewind/buggify/<name>` fault injection.
+    SetBuggify { enabled: bool },
     /// Injects deterministic console input bytes into `node`'s
     /// `/dev/rewind-console` device.
     SendInput { node: usize, data: Vec<u8> },
@@ -117,6 +166,10 @@ fn default_http_ok() -> u16 {
     200
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Schedule-seed-driven nemesis configuration for `rewind cluster check`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NemesisConfig {
@@ -132,9 +185,16 @@ pub struct NemesisConfig {
     pub restart_prob_ppm: u32,
     /// Maximum number of simultaneously crashed nodes.
     pub max_crashed: usize,
-    /// Node indices the nemesis is allowed to crash (typically `service` nodes,
-    /// never the test `driver`).
+    /// Node indices the nemesis is allowed to crash/clog/pause (typically
+    /// `service` nodes, never protected nodes or the test `driver`).
     pub eligible_nodes: Vec<usize>,
+    /// Probability (ppm) on a tick to clog an eligible node's interface.
+    #[serde(default)]
+    pub clog_prob_ppm: u32,
+    /// Probability (ppm) on a tick to pause an eligible live node (or resume a
+    /// paused node).
+    #[serde(default)]
+    pub pause_prob_ppm: u32,
 }
 
 /// Static configuration of the virtual L2 switch.
@@ -163,6 +223,9 @@ pub struct NetSwitchConfig {
     /// Static node metadata served by `GET http://rewind/meta`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_nodes: Vec<crate::control::ControlNodeMeta>,
+    /// Whether `http://rewind/buggify/<name>` starts enabled.
+    #[serde(default)]
+    pub buggify_enabled: bool,
 }
 
 impl Default for NetSwitchConfig {
@@ -180,6 +243,7 @@ impl Default for NetSwitchConfig {
             nemesis: None,
             control_ip: None,
             control_nodes: Vec::new(),
+            buggify_enabled: false,
         }
     }
 }
@@ -283,6 +347,44 @@ pub enum NetEvent {
         drop_ppm: u32,
         duplicate_ppm: u32,
     },
+    Clog {
+        ns: u64,
+        from: Option<usize>,
+        to: Option<usize>,
+        until_ns: u64,
+        mode: ClogMode,
+    },
+    Unclog {
+        ns: u64,
+        from: Option<usize>,
+        to: Option<usize>,
+    },
+    NodePause {
+        ns: u64,
+        node: usize,
+    },
+    NodeResume {
+        ns: u64,
+        node: usize,
+    },
+    ClockStep {
+        ns: u64,
+        node: usize,
+        delta_ns: u64,
+    },
+    ClockDrift {
+        ns: u64,
+        node: usize,
+        drift_ppm: i32,
+    },
+    NemesisToggled {
+        ns: u64,
+        enabled: bool,
+    },
+    BuggifyToggled {
+        ns: u64,
+        enabled: bool,
+    },
 }
 
 /// Action the switch instructs the cluster coordinator to perform on a VM.
@@ -290,6 +392,10 @@ pub enum NetEvent {
 pub enum FaultAction {
     Crash(usize),
     Restart(usize),
+    Pause(usize),
+    Resume(usize),
+    StepClock(usize, u64),
+    SetClockDrift(usize, i32),
     SendInput(usize, Vec<u8>),
     HidEvents(usize, Vec<HidEvent>),
 }
@@ -304,6 +410,10 @@ pub struct NetStats {
     pub partitions: u64,
     pub crashes: u64,
     pub restarts: u64,
+    #[serde(default)]
+    pub clogs: u64,
+    #[serde(default)]
+    pub pauses: u64,
 }
 
 /// Serializable snapshot of the virtual switch, stored in a cluster keyframe.
@@ -312,6 +422,16 @@ pub struct NetSwitchState {
     pub in_flight: Vec<InFlightFrame>,
     pub blocked: BTreeSet<(usize, usize)>,
     pub crashed: BTreeSet<usize>,
+    #[serde(default)]
+    pub paused: BTreeSet<usize>,
+    #[serde(default)]
+    pub clogged_links: BTreeMap<(usize, usize), u64>,
+    #[serde(default)]
+    pub clogged_send: BTreeMap<usize, u64>,
+    #[serde(default)]
+    pub clogged_recv: BTreeMap<usize, u64>,
+    #[serde(default = "default_true")]
+    pub nemesis_enabled: bool,
     #[serde(default)]
     pub links: BTreeMap<(usize, usize), LinkOverride>,
     /// Per-source monotonic TX sequence counters (drives stateless link RNG).
@@ -337,6 +457,11 @@ pub struct NetSwitch {
     in_flight: Vec<BinaryHeap<Reverse<InFlightFrame>>>,
     blocked: BTreeSet<(usize, usize)>,
     crashed: BTreeSet<usize>,
+    paused: BTreeSet<usize>,
+    clogged_links: BTreeMap<(usize, usize), u64>,
+    clogged_send: BTreeMap<usize, u64>,
+    clogged_recv: BTreeMap<usize, u64>,
+    nemesis_enabled: bool,
     links: BTreeMap<(usize, usize), LinkOverride>,
     /// Per-source monotonic TX sequence counters.
     src_tx_seq: Vec<u64>,
@@ -363,6 +488,13 @@ const NEMESIS_RESTART_ROLL: u64 = 4;
 const NEMESIS_RESTART_PICK: u64 = 5;
 const NEMESIS_CRASH_ROLL: u64 = 6;
 const NEMESIS_CRASH_PICK: u64 = 7;
+const NEMESIS_CLOG_ROLL: u64 = 8;
+const NEMESIS_CLOG_PICK: u64 = 9;
+const NEMESIS_CLOG_DUR: u64 = 10;
+const NEMESIS_PAUSE_ROLL: u64 = 11;
+const NEMESIS_PAUSE_PICK: u64 = 12;
+const NEMESIS_RESUME_ROLL: u64 = 13;
+const NEMESIS_RESUME_PICK: u64 = 14;
 
 fn mix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -418,14 +550,23 @@ impl NetSwitch {
             .as_ref()
             .map_or(u64::MAX, |n| n.tick_ns.max(1));
         let node_count = config.node_count;
-        let control =
-            crate::control::ControlPlane::new(config.control_ip, config.control_nodes.clone());
+        let control = crate::control::ControlPlane::new(
+            config.control_ip,
+            config.control_nodes.clone(),
+            config.buggify_enabled,
+            config.seed,
+        );
         NetSwitch {
             config,
             macs,
             in_flight: (0..node_count).map(|_| BinaryHeap::new()).collect(),
             blocked: BTreeSet::new(),
             crashed: BTreeSet::new(),
+            paused: BTreeSet::new(),
+            clogged_links: BTreeMap::new(),
+            clogged_send: BTreeMap::new(),
+            clogged_recv: BTreeMap::new(),
+            nemesis_enabled: true,
             links,
             src_tx_seq: vec![0; node_count],
             timed_faults,
@@ -466,6 +607,7 @@ impl NetSwitch {
         let control = crate::control::ControlPlane::restore(
             config.control_ip,
             config.control_nodes.clone(),
+            config.seed,
             state.control,
         );
         NetSwitch {
@@ -474,6 +616,11 @@ impl NetSwitch {
             in_flight,
             blocked: state.blocked,
             crashed: state.crashed,
+            paused: state.paused,
+            clogged_links: state.clogged_links,
+            clogged_send: state.clogged_send,
+            clogged_recv: state.clogged_recv,
+            nemesis_enabled: state.nemesis_enabled,
             links,
             src_tx_seq,
             timed_faults,
@@ -500,6 +647,11 @@ impl NetSwitch {
             in_flight,
             blocked: self.blocked.clone(),
             crashed: self.crashed.clone(),
+            paused: self.paused.clone(),
+            clogged_links: self.clogged_links.clone(),
+            clogged_send: self.clogged_send.clone(),
+            clogged_recv: self.clogged_recv.clone(),
+            nemesis_enabled: self.nemesis_enabled,
             links: self.links.clone(),
             src_tx_seq: self.src_tx_seq.clone(),
             next_timed_fault_idx: self.next_timed_fault_idx,
@@ -590,6 +742,63 @@ impl NetSwitch {
 
     pub fn is_crashed(&self, node: usize) -> bool {
         self.crashed.contains(&node)
+    }
+
+    pub fn is_paused(&self, node: usize) -> bool {
+        self.paused.contains(&node)
+    }
+
+    pub fn nemesis_enabled(&self) -> bool {
+        self.nemesis_enabled
+    }
+
+    pub fn buggify_enabled(&self) -> bool {
+        self.control.buggify_enabled()
+    }
+
+    pub fn buggify_sites(&self) -> &BTreeMap<String, bool> {
+        self.control.buggify_sites()
+    }
+
+    pub fn probes(&self) -> &BTreeMap<String, u64> {
+        self.control.probes()
+    }
+
+    fn clog_until(&self, src: usize, dst: usize) -> u64 {
+        let mut until = 0u64;
+        if let Some(&u) = self.clogged_links.get(&(src, dst)) {
+            until = until.max(u);
+        }
+        if let Some(&u) = self.clogged_send.get(&src) {
+            until = until.max(u);
+        }
+        if let Some(&u) = self.clogged_recv.get(&dst) {
+            until = until.max(u);
+        }
+        until
+    }
+
+    fn reschedule_unclogged(&mut self, at_ns: u64, filter: impl Fn(usize, usize) -> bool) {
+        for dst in 0..self.in_flight.len() {
+            let mut frames: Vec<InFlightFrame> =
+                self.in_flight[dst].drain().map(|r| r.0).collect();
+            for f in &mut frames {
+                if f.src == crate::control::CONTROL_SRC_NODE || !filter(f.src, dst) {
+                    continue;
+                }
+                let base = self.link_min_latency_ns(f.src, dst);
+                let min_deliver = at_ns
+                    .saturating_add(base)
+                    .max(f.tx_at_ns.saturating_add(base))
+                    .max(self.clog_until(f.src, dst));
+                if f.deliver_at_ns > min_deliver {
+                    f.deliver_at_ns = min_deliver;
+                }
+            }
+            for f in frames {
+                self.in_flight[dst].push(Reverse(f));
+            }
+        }
     }
 
     /// Routes one frame transmitted by `src` at cluster time `now_ns`, returning
@@ -718,7 +927,8 @@ impl NetSwitch {
             };
             let deliver_at_ns = now_ns
                 .saturating_add(base_latency)
-                .saturating_add(jitter_draw);
+                .saturating_add(jitter_draw)
+                .max(self.clog_until(src, dst));
             self.in_flight[dst].push(Reverse(InFlightFrame {
                 deliver_at_ns,
                 tx_at_ns: now_ns,
@@ -865,7 +1075,7 @@ impl NetSwitch {
 
     /// Whether any Ethernet frame is currently in flight on the switch.
     pub fn has_in_flight_frames(&self) -> bool {
-        !self.in_flight.is_empty()
+        self.in_flight.iter().any(|h| !h.is_empty())
     }
 
     /// Whether any timed fault, nemesis tick, or ready pinned fault is pending.
@@ -886,7 +1096,7 @@ impl NetSwitch {
             .config
             .nemesis
             .as_ref()
-            .filter(|_| self.next_nemesis_ns < self.config.fault_window.end)
+            .filter(|_| self.nemesis_enabled && self.next_nemesis_ns < self.config.fault_window.end)
             .map(|_| self.next_nemesis_ns);
         match (scripted, nemesis) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -955,10 +1165,12 @@ impl NetSwitch {
             }
         }
 
-        // 2. Schedule-driven nemesis ticks
-        if let Some(nem) = self.config.nemesis.clone() {
+        // 2. Schedule-driven nemesis ticks (skipped while disabled via SetNemesis)
+        if self.nemesis_enabled
+            && let Some(nem) = self.config.nemesis.clone()
+        {
             let tick = nem.tick_ns.max(1);
-            while self.next_nemesis_ns <= up_to_ns {
+            while self.nemesis_enabled && self.next_nemesis_ns <= up_to_ns {
                 let t = self.next_nemesis_ns;
                 if t >= self.config.fault_window.end {
                     self.next_nemesis_ns = u64::MAX;
@@ -1097,8 +1309,101 @@ impl NetSwitch {
                     });
                 }
             }
+            FaultKind::ClogLink { from, to, until_ns } => {
+                if *from < self.config.node_count && *to < self.config.node_count && from != to {
+                    self.clogged_links.insert((*from, *to), *until_ns);
+                    self.stats.clogs += 1;
+                    events.push(NetEvent::Clog {
+                        ns: at_ns,
+                        from: Some(*from),
+                        to: Some(*to),
+                        until_ns: *until_ns,
+                        mode: ClogMode::All,
+                    });
+                }
+            }
+            FaultKind::UnclogLink { from, to } => {
+                if self.clogged_links.remove(&(*from, *to)).is_some() {
+                    let f = *from;
+                    let t = *to;
+                    self.reschedule_unclogged(at_ns, |src, dst| src == f && dst == t);
+                    events.push(NetEvent::Unclog {
+                        ns: at_ns,
+                        from: Some(f),
+                        to: Some(t),
+                    });
+                }
+            }
+            FaultKind::ClogNode {
+                node,
+                until_ns,
+                mode,
+            } => {
+                if *node < self.config.node_count {
+                    match mode {
+                        ClogMode::All => {
+                            self.clogged_send.insert(*node, *until_ns);
+                            self.clogged_recv.insert(*node, *until_ns);
+                        }
+                        ClogMode::Send => {
+                            self.clogged_send.insert(*node, *until_ns);
+                        }
+                        ClogMode::Recv => {
+                            self.clogged_recv.insert(*node, *until_ns);
+                        }
+                    }
+                    self.stats.clogs += 1;
+                    events.push(NetEvent::Clog {
+                        ns: at_ns,
+                        from: Some(*node),
+                        to: None,
+                        until_ns: *until_ns,
+                        mode: *mode,
+                    });
+                }
+            }
+            FaultKind::UnclogNode { node } => {
+                let n = *node;
+                let mut changed = false;
+                if self.clogged_send.remove(&n).is_some() {
+                    changed = true;
+                }
+                if self.clogged_recv.remove(&n).is_some() {
+                    changed = true;
+                }
+                let prev_len = self.clogged_links.len();
+                self.clogged_links.retain(|&(src, dst), _| src != n && dst != n);
+                if self.clogged_links.len() != prev_len {
+                    changed = true;
+                }
+                if changed {
+                    self.reschedule_unclogged(at_ns, |src, dst| src == n || dst == n);
+                    events.push(NetEvent::Unclog {
+                        ns: at_ns,
+                        from: Some(n),
+                        to: None,
+                    });
+                }
+            }
+            FaultKind::UnclogAll => {
+                if !self.clogged_links.is_empty()
+                    || !self.clogged_send.is_empty()
+                    || !self.clogged_recv.is_empty()
+                {
+                    self.clogged_links.clear();
+                    self.clogged_send.clear();
+                    self.clogged_recv.clear();
+                    self.reschedule_unclogged(at_ns, |_, _| true);
+                    events.push(NetEvent::Unclog {
+                        ns: at_ns,
+                        from: None,
+                        to: None,
+                    });
+                }
+            }
             FaultKind::Crash { node } => {
                 if *node < self.config.node_count && self.crashed.insert(*node) {
+                    self.paused.remove(node);
                     self.control.drop_node(*node);
                     self.stats.crashes += 1;
                     events.push(NetEvent::NodeCrash {
@@ -1110,8 +1415,80 @@ impl NetSwitch {
             }
             FaultKind::Restart { node } => {
                 if *node < self.config.node_count && self.crashed.remove(node) {
+                    self.paused.remove(node);
                     self.stats.restarts += 1;
                     actions.push(FaultAction::Restart(*node));
+                }
+            }
+            FaultKind::Pause { node } => {
+                if *node < self.config.node_count
+                    && !self.crashed.contains(node)
+                    && self.paused.insert(*node)
+                {
+                    self.stats.pauses += 1;
+                    events.push(NetEvent::NodePause {
+                        ns: at_ns,
+                        node: *node,
+                    });
+                    actions.push(FaultAction::Pause(*node));
+                }
+            }
+            FaultKind::Resume { node } => {
+                if *node < self.config.node_count
+                    && !self.crashed.contains(node)
+                    && self.paused.remove(node)
+                {
+                    events.push(NetEvent::NodeResume {
+                        ns: at_ns,
+                        node: *node,
+                    });
+                    actions.push(FaultAction::Resume(*node));
+                }
+            }
+            FaultKind::StepClock { node, delta_ns } => {
+                if *node < self.config.node_count && !self.crashed.contains(node) && *delta_ns > 0 {
+                    events.push(NetEvent::ClockStep {
+                        ns: at_ns,
+                        node: *node,
+                        delta_ns: *delta_ns,
+                    });
+                    actions.push(FaultAction::StepClock(*node, *delta_ns));
+                }
+            }
+            FaultKind::SetClockDrift { node, drift_ppm } => {
+                if *node < self.config.node_count && !self.crashed.contains(node) {
+                    events.push(NetEvent::ClockDrift {
+                        ns: at_ns,
+                        node: *node,
+                        drift_ppm: *drift_ppm,
+                    });
+                    actions.push(FaultAction::SetClockDrift(*node, *drift_ppm));
+                }
+            }
+            FaultKind::SetNemesis { enabled } => {
+                if self.nemesis_enabled != *enabled {
+                    self.nemesis_enabled = *enabled;
+                    if *enabled
+                        && let Some(nem) = &self.config.nemesis
+                    {
+                        let tick = nem.tick_ns.max(1);
+                        if self.next_nemesis_ns <= at_ns {
+                            self.next_nemesis_ns = at_ns.saturating_add(tick);
+                        }
+                    }
+                    events.push(NetEvent::NemesisToggled {
+                        ns: at_ns,
+                        enabled: *enabled,
+                    });
+                }
+            }
+            FaultKind::SetBuggify { enabled } => {
+                if self.control.buggify_enabled() != *enabled {
+                    self.control.set_buggify(*enabled);
+                    events.push(NetEvent::BuggifyToggled {
+                        ns: at_ns,
+                        enabled: *enabled,
+                    });
                 }
             }
             FaultKind::SendInput { node, data } => {
@@ -1227,6 +1604,75 @@ impl NetSwitch {
                     self.apply_fault(at_ns, &FaultKind::Crash { node: pick }, events, actions);
                 }
             }
+
+            // Clog an eligible live node's interface for 1..=4 nemesis ticks.
+            if nem.clog_prob_ppm > 0 && !live_eligible.is_empty() {
+                let draw =
+                    (nemesis_draw(seed, at_ns, NEMESIS_CLOG_ROLL) % u64::from(PPM_SCALE)) as u32;
+                if draw < nem.clog_prob_ppm {
+                    let pick = live_eligible[(nemesis_draw(seed, at_ns, NEMESIS_CLOG_PICK)
+                        as usize)
+                        % live_eligible.len()];
+                    let ticks = 1 + (nemesis_draw(seed, at_ns, NEMESIS_CLOG_DUR) % 4);
+                    let until_ns = at_ns.saturating_add(nem.tick_ns.max(1).saturating_mul(ticks));
+                    self.apply_fault(
+                        at_ns,
+                        &FaultKind::ClogNode {
+                            node: pick,
+                            until_ns,
+                            mode: ClogMode::All,
+                        },
+                        events,
+                        actions,
+                    );
+                }
+            }
+
+            // Pause or resume an eligible node (GC / hypervisor stall modeling).
+            if nem.pause_prob_ppm > 0 {
+                let paused_eligible: Vec<usize> = nem
+                    .eligible_nodes
+                    .iter()
+                    .copied()
+                    .filter(|n| !self.crashed.contains(n) && self.paused.contains(n))
+                    .collect();
+                if !paused_eligible.is_empty() {
+                    let resume_prob = nem
+                        .heal_prob_ppm
+                        .max(nem.restart_prob_ppm)
+                        .max(nem.pause_prob_ppm);
+                    let draw = (nemesis_draw(seed, at_ns, NEMESIS_RESUME_ROLL)
+                        % u64::from(PPM_SCALE)) as u32;
+                    if draw < resume_prob {
+                        let pick = paused_eligible[(nemesis_draw(seed, at_ns, NEMESIS_RESUME_PICK)
+                            as usize)
+                            % paused_eligible.len()];
+                        self.apply_fault(at_ns, &FaultKind::Resume { node: pick }, events, actions);
+                    }
+                } else {
+                    let unpaused_live: Vec<usize> = live_eligible
+                        .iter()
+                        .copied()
+                        .filter(|n| !self.paused.contains(n))
+                        .collect();
+                    let max_paused = nem.max_crashed.max(1);
+                    if self.paused.len() < max_paused && !unpaused_live.is_empty() {
+                        let draw = (nemesis_draw(seed, at_ns, NEMESIS_PAUSE_ROLL)
+                            % u64::from(PPM_SCALE)) as u32;
+                        if draw < nem.pause_prob_ppm {
+                            let pick = unpaused_live[(nemesis_draw(seed, at_ns, NEMESIS_PAUSE_PICK)
+                                as usize)
+                                % unpaused_live.len()];
+                            self.apply_fault(
+                                at_ns,
+                                &FaultKind::Pause { node: pick },
+                                events,
+                                actions,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1326,6 +1772,14 @@ const TAG_HEAL: u8 = 6;
 const TAG_NODE_CRASH: u8 = 7;
 const TAG_NODE_RESTART: u8 = 8;
 const TAG_LINK_UPDATED: u8 = 9;
+const TAG_CLOG: u8 = 10;
+const TAG_UNCLOG: u8 = 11;
+const TAG_NODE_PAUSE: u8 = 12;
+const TAG_NODE_RESUME: u8 = 13;
+const TAG_CLOCK_STEP: u8 = 14;
+const TAG_CLOCK_DRIFT: u8 = 15;
+const TAG_NEMESIS_TOGGLED: u8 = 16;
+const TAG_BUGGIFY_TOGGLED: u8 = 17;
 
 fn put_varint(buf: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -1422,7 +1876,15 @@ fn encode_event_body(ev: &NetEvent, prev_ns: &mut u64, out: &mut Vec<u8>) {
         | NetEvent::Heal { ns }
         | NetEvent::NodeCrash { ns, .. }
         | NetEvent::NodeRestart { ns, .. }
-        | NetEvent::LinkUpdated { ns, .. } => *ns,
+        | NetEvent::LinkUpdated { ns, .. }
+        | NetEvent::Clog { ns, .. }
+        | NetEvent::Unclog { ns, .. }
+        | NetEvent::NodePause { ns, .. }
+        | NetEvent::NodeResume { ns, .. }
+        | NetEvent::ClockStep { ns, .. }
+        | NetEvent::ClockDrift { ns, .. }
+        | NetEvent::NemesisToggled { ns, .. }
+        | NetEvent::BuggifyToggled { ns, .. } => *ns,
     };
     let delta = (ns as i64).wrapping_sub(*prev_ns as i64);
     *prev_ns = ns;
@@ -1538,6 +2000,64 @@ fn encode_event_body(ev: &NetEvent, prev_ns: &mut u64, out: &mut Vec<u8>) {
             put_varint(out, u64::from(*drop_ppm));
             put_varint(out, u64::from(*duplicate_ppm));
         }
+        NetEvent::Clog {
+            from,
+            to,
+            until_ns,
+            mode,
+            ..
+        } => {
+            out.push(TAG_CLOG);
+            put_varint(out, zigzag_encode(delta));
+            put_varint(out, from.map_or(0, |v| (v as u64) + 1));
+            put_varint(out, to.map_or(0, |v| (v as u64) + 1));
+            put_varint(out, *until_ns);
+            out.push(match mode {
+                ClogMode::All => 0,
+                ClogMode::Send => 1,
+                ClogMode::Recv => 2,
+            });
+        }
+        NetEvent::Unclog { from, to, .. } => {
+            out.push(TAG_UNCLOG);
+            put_varint(out, zigzag_encode(delta));
+            put_varint(out, from.map_or(0, |v| (v as u64) + 1));
+            put_varint(out, to.map_or(0, |v| (v as u64) + 1));
+        }
+        NetEvent::NodePause { node, .. } => {
+            out.push(TAG_NODE_PAUSE);
+            put_varint(out, zigzag_encode(delta));
+            put_varint(out, *node as u64);
+        }
+        NetEvent::NodeResume { node, .. } => {
+            out.push(TAG_NODE_RESUME);
+            put_varint(out, zigzag_encode(delta));
+            put_varint(out, *node as u64);
+        }
+        NetEvent::ClockStep { node, delta_ns, .. } => {
+            out.push(TAG_CLOCK_STEP);
+            put_varint(out, zigzag_encode(delta));
+            put_varint(out, *node as u64);
+            put_varint(out, *delta_ns);
+        }
+        NetEvent::ClockDrift {
+            node, drift_ppm, ..
+        } => {
+            out.push(TAG_CLOCK_DRIFT);
+            put_varint(out, zigzag_encode(delta));
+            put_varint(out, *node as u64);
+            put_varint(out, zigzag_encode(i64::from(*drift_ppm)));
+        }
+        NetEvent::NemesisToggled { enabled, .. } => {
+            out.push(TAG_NEMESIS_TOGGLED);
+            put_varint(out, zigzag_encode(delta));
+            out.push(u8::from(*enabled));
+        }
+        NetEvent::BuggifyToggled { enabled, .. } => {
+            out.push(TAG_BUGGIFY_TOGGLED);
+            put_varint(out, zigzag_encode(delta));
+            out.push(u8::from(*enabled));
+        }
     }
 }
 
@@ -1626,6 +2146,72 @@ fn decode_event_body(mut s: &[u8], prev_ns: &mut u64) -> std::io::Result<NetEven
             jitter_ns: get_varint(&mut s)?,
             drop_ppm: get_varint(&mut s)? as u32,
             duplicate_ppm: get_varint(&mut s)? as u32,
+        },
+        TAG_CLOG => {
+            let from = match get_varint(&mut s)? {
+                0 => None,
+                v => Some((v - 1) as usize),
+            };
+            let to = match get_varint(&mut s)? {
+                0 => None,
+                v => Some((v - 1) as usize),
+            };
+            let until_ns = get_varint(&mut s)?;
+            let mode = match get_u8(&mut s)? {
+                0 => ClogMode::All,
+                1 => ClogMode::Send,
+                2 => ClogMode::Recv,
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown clog mode {other} in network.bin"),
+                    ));
+                }
+            };
+            NetEvent::Clog {
+                ns,
+                from,
+                to,
+                until_ns,
+                mode,
+            }
+        }
+        TAG_UNCLOG => {
+            let from = match get_varint(&mut s)? {
+                0 => None,
+                v => Some((v - 1) as usize),
+            };
+            let to = match get_varint(&mut s)? {
+                0 => None,
+                v => Some((v - 1) as usize),
+            };
+            NetEvent::Unclog { ns, from, to }
+        }
+        TAG_NODE_PAUSE => NetEvent::NodePause {
+            ns,
+            node: get_varint(&mut s)? as usize,
+        },
+        TAG_NODE_RESUME => NetEvent::NodeResume {
+            ns,
+            node: get_varint(&mut s)? as usize,
+        },
+        TAG_CLOCK_STEP => NetEvent::ClockStep {
+            ns,
+            node: get_varint(&mut s)? as usize,
+            delta_ns: get_varint(&mut s)?,
+        },
+        TAG_CLOCK_DRIFT => NetEvent::ClockDrift {
+            ns,
+            node: get_varint(&mut s)? as usize,
+            drift_ppm: zigzag_decode(get_varint(&mut s)?) as i32,
+        },
+        TAG_NEMESIS_TOGGLED => NetEvent::NemesisToggled {
+            ns,
+            enabled: get_u8(&mut s)? != 0,
+        },
+        TAG_BUGGIFY_TOGGLED => NetEvent::BuggifyToggled {
+            ns,
+            enabled: get_u8(&mut s)? != 0,
         },
         other => {
             return Err(std::io::Error::new(
@@ -1813,6 +2399,7 @@ mod tests {
             nemesis: None,
             control_ip: None,
             control_nodes: Vec::new(),
+            buggify_enabled: false,
         };
 
         let mut a = NetSwitch::new(cfg.clone());
@@ -1892,6 +2479,51 @@ mod tests {
                 drop_ppm: 10_000,
                 duplicate_ppm: 1_000,
             },
+            NetEvent::Clog {
+                ns: 10_000_000,
+                from: Some(0),
+                to: Some(1),
+                until_ns: 20_000_000,
+                mode: ClogMode::All,
+            },
+            NetEvent::Clog {
+                ns: 10_500_000,
+                from: Some(2),
+                to: None,
+                until_ns: 25_000_000,
+                mode: ClogMode::Send,
+            },
+            NetEvent::Unclog {
+                ns: 11_000_000,
+                from: None,
+                to: None,
+            },
+            NetEvent::NodePause {
+                ns: 12_000_000,
+                node: 1,
+            },
+            NetEvent::NodeResume {
+                ns: 13_000_000,
+                node: 1,
+            },
+            NetEvent::ClockStep {
+                ns: 14_000_000,
+                node: 0,
+                delta_ns: 5_000_000_000,
+            },
+            NetEvent::ClockDrift {
+                ns: 15_000_000,
+                node: 0,
+                drift_ppm: -5000,
+            },
+            NetEvent::NemesisToggled {
+                ns: 16_000_000,
+                enabled: false,
+            },
+            NetEvent::BuggifyToggled {
+                ns: 17_000_000,
+                enabled: true,
+            },
         ];
 
         let mut writer = NetLogWriter::new(Vec::new());
@@ -1934,6 +2566,7 @@ mod tests {
             nemesis: None,
             control_ip: None,
             control_nodes: Vec::new(),
+            buggify_enabled: false,
         };
         let mut ab = NetSwitch::new(cfg.clone());
         let mut ba = NetSwitch::new(cfg);
@@ -1986,5 +2619,67 @@ mod tests {
         assert_eq!(sw.next_timed_fault_ns(), Some(5_000_000));
         sw.fire_due_timed_faults(5_000_000, &mut ev);
         assert!(!sw.is_blocked(0, 1));
+    }
+
+    #[test]
+    fn clog_queues_without_dropping_and_unclog_releases_early() {
+        let cfg = NetSwitchConfig {
+            node_count: 2,
+            latency_ns: 1_000_000,
+            ..NetSwitchConfig::default()
+        };
+        let mut sw = NetSwitch::new(cfg);
+        let mut ev = Vec::new();
+        sw.apply_immediate_fault(
+            1_000_000,
+            &FaultKind::ClogLink {
+                from: 0,
+                to: 1,
+                until_ns: 100_000_000,
+            },
+            &mut ev,
+        );
+        let f = eth_frame(mac_for_node(1), mac_for_node(0), b"clogged");
+        sw.on_tx(2_000_000, 0, f, &mut ev);
+        assert_eq!(sw.next_delivery_for(1), Some(100_000_000));
+        assert!(sw.pop_due_frames_for(1, 50_000_000).is_empty());
+
+        // Manual unclog at 10ms reschedules the queued frame to 10ms + 1ms = 11ms.
+        sw.apply_immediate_fault(10_000_000, &FaultKind::UnclogLink { from: 0, to: 1 }, &mut ev);
+        assert_eq!(sw.next_delivery_for(1), Some(11_000_000));
+        let due = sw.pop_due_frames_for(1, 11_000_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(sw.stats().dropped_frames, 0);
+    }
+
+    #[test]
+    fn set_nemesis_pauses_and_resumes_ticks() {
+        let cfg = NetSwitchConfig {
+            node_count: 2,
+            latency_ns: 1_000_000,
+            nemesis: Some(NemesisConfig {
+                tick_ns: 5_000_000,
+                partition_prob_ppm: PPM_SCALE,
+                heal_prob_ppm: 0,
+                crash_prob_ppm: 0,
+                restart_prob_ppm: 0,
+                max_crashed: 0,
+                eligible_nodes: vec![0, 1],
+                clog_prob_ppm: 0,
+                pause_prob_ppm: 0,
+            }),
+            ..NetSwitchConfig::default()
+        };
+        let mut sw = NetSwitch::new(cfg);
+        let mut ev = Vec::new();
+        assert_eq!(sw.next_timed_fault_ns(), Some(5_000_000));
+        sw.apply_immediate_fault(1_000_000, &FaultKind::SetNemesis { enabled: false }, &mut ev);
+        assert!(!sw.nemesis_enabled());
+        assert_eq!(sw.next_timed_fault_ns(), None);
+        sw.fire_due_timed_faults(50_000_000, &mut ev);
+        assert!(sw.active_partitions().is_empty());
+        // Re-enabling at 50ms schedules the next tick at 55ms, not a backlog.
+        sw.apply_immediate_fault(50_000_000, &FaultKind::SetNemesis { enabled: true }, &mut ev);
+        assert_eq!(sw.next_timed_fault_ns(), Some(55_000_000));
     }
 }
