@@ -579,6 +579,63 @@ fn dispatch(
                 "cluster_step": cluster_step,
             }))
         }
+        "cluster.save_snapshot" => {
+            #[derive(Deserialize)]
+            struct P {
+                path: PathBuf,
+                name: Option<String>,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.save_snapshot")?;
+            let resolved = if p.path.is_absolute() {
+                p.path
+            } else {
+                defaults.workdir.join(p.path)
+            };
+            let s = require_session(session)?;
+            let (snapshot, cluster_ns, cluster_step) = s.save_snapshot(p.name, &resolved)?;
+            Ok(json!({
+                "snapshot": snapshot,
+                "path": resolved.display().to_string(),
+                "cluster_ns": cluster_ns,
+                "cluster_step": cluster_step,
+            }))
+        }
+        "cluster.start_from_snapshot" => {
+            #[derive(Deserialize)]
+            struct P {
+                path: PathBuf,
+                name: Option<String>,
+                keyframes: Option<bool>,
+                #[serde(default)]
+                echo: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.start_from_snapshot")?;
+            let resolved = if p.path.is_absolute() {
+                p.path
+            } else {
+                defaults.workdir.join(p.path)
+            };
+            let take_kf = env_bool("REWIND_KEYFRAMES")
+                .or(p.keyframes)
+                .unwrap_or(true);
+            let kf_mode = if take_kf {
+                Keyframes::Take
+            } else {
+                Keyframes::Skip
+            };
+            let s = ClusterSession::start_from_snapshot(
+                defaults.home.clone(),
+                &resolved,
+                p.name,
+                kf_mode,
+                p.echo,
+            )?;
+            let status = s.status();
+            *session = Some(s);
+            Ok(serde_json::to_value(status)?)
+        }
         "cluster.restore" => {
             #[derive(Deserialize)]
             struct P {

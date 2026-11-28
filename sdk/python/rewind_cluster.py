@@ -25,12 +25,16 @@ Example::
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import socket
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 __all__ = [
     "Cluster",
@@ -587,6 +591,95 @@ class Cluster:
         res = self._call("cluster.snapshot", params)
         return str(res["snapshot"])
 
+    def save_snapshot(self, path: Union[str, os.PathLike[str]], name: Optional[str] = None) -> str:
+        """Persists a snapshot to ``path`` so parallel workers can boot from it."""
+        params: Dict[str, Any] = {"path": os.fspath(path)}
+        if name is not None:
+            params["name"] = name
+        res = self._call("cluster.save_snapshot", params)
+        return str(res["path"])
+
+    def node(self, name: str) -> NodeHandle:
+        """Returns a :class:`NodeHandle` for ``name`` (useful after :meth:`from_snapshot`)."""
+        return NodeHandle(self, name)
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        path: Union[str, os.PathLike[str]],
+        *,
+        name: Optional[str] = None,
+        keyframes: Optional[bool] = None,
+        echo: bool = False,
+        clock: Optional[str] = None,
+        cpu: Optional[str] = None,
+        rewind_bin: Optional[str] = None,
+        socket_path: Optional[str] = None,
+    ) -> "Cluster":
+        """Starts an independent cluster session restored directly from ``path``.
+
+        Safe to call concurrently from many threads or processes sharing the
+        same Rewind page store for parallel fan-out from one warm snapshot.
+        """
+        c = cls(
+            name=name or "snapshot-branch",
+            keyframes=keyframes,
+            echo=echo,
+            clock=clock,
+            cpu=cpu,
+            rewind_bin=rewind_bin,
+            socket_path=socket_path,
+        )
+        c._connect()
+        params: Dict[str, Any] = {"path": os.fspath(path), "echo": echo}
+        if name is not None:
+            params["name"] = name
+        if keyframes is not None:
+            params["keyframes"] = keyframes
+        c._call("cluster.start_from_snapshot", params)
+        c._started = True
+        return c
+
+    @classmethod
+    def fan_out(
+        cls,
+        snapshot_path: Union[str, os.PathLike[str]],
+        items: Sequence[T],
+        worker_fn: Callable[["Cluster", T], R],
+        *,
+        max_workers: Optional[int] = None,
+        name_prefix: str = "branch",
+        keyframes: Optional[bool] = None,
+        echo: bool = False,
+        clock: Optional[str] = None,
+        cpu: Optional[str] = None,
+        rewind_bin: Optional[str] = None,
+    ) -> List[Tuple[T, R]]:
+        """Runs ``worker_fn(cluster, item)`` in parallel across ``items``,
+        each starting from its own independent cluster restored from ``snapshot_path``.
+        """
+        workers = max_workers or min(len(items), os.cpu_count() or 1) or 1
+
+        def _run_one(item: T) -> Tuple[T, R]:
+            with cls.from_snapshot(
+                snapshot_path,
+                name=f"{name_prefix}-{item}",
+                keyframes=keyframes,
+                echo=echo,
+                clock=clock,
+                cpu=cpu,
+                rewind_bin=rewind_bin,
+            ) as c:
+                return item, worker_fn(c, item)
+
+        results: Dict[int, Tuple[T, R]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_run_one, item): idx for idx, item in enumerate(items)}
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                results[idx] = fut.result()
+        return [results[i] for i in range(len(items))]
+
     def restore(self, snapshot: str) -> Dict[str, Any]:
         return self._call("cluster.restore", {"snapshot": snapshot})
 
@@ -610,6 +703,7 @@ class Cluster:
         return res
 
     def close(self) -> None:
+        self._started = False
         try:
             if self._wfile is not None:
                 try:

@@ -34,8 +34,8 @@ use rewind_vmm::net::{FaultKind, NetEvent, NetLogWriter, NetStats, NetSwitchConf
 
 use crate::cluster::{
     CLUSTER_KEYFRAME_INTERVAL_NS, ClusterRun, ClusterRunOptions, PreparedCluster,
-    compute_cluster_id, compute_node_parents, format_reason, judge_cluster_node, parse_role,
-    parse_stop_when, prepare_cluster, save_cluster_keyframe,
+    compute_cluster_id, compute_node_parents, config_from_manifest, format_reason,
+    judge_cluster_node, parse_role, parse_stop_when, prepare_cluster, save_cluster_keyframe,
 };
 use crate::home::{Guest, Home};
 use crate::inspect::{Inspection, cat_on_machine, list_on_machine};
@@ -69,7 +69,7 @@ impl LogStream {
 }
 
 /// Live per-node line buffers and read cursors (snapshot/restore-friendly).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct NodeBuffers {
     output_lines: Vec<String>,
     output_partial: String,
@@ -354,6 +354,57 @@ struct SessionSnapshot {
     cluster_step: u64,
 }
 
+const SAVED_SNAP_MAGIC: &[u8; 8] = b"rwcsnap\0";
+const SAVED_SNAP_VERSION: u32 = 1;
+
+/// Portable on-disk cluster snapshot metadata referencing content-addressed
+/// guest RAM pages in `home.store()`. Multiple independent worker processes can
+/// call [`ClusterSession::start_from_snapshot`] concurrently on the same file
+/// to fan out parallel branches (e.g. parallel E2E tests) from one warm setup.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SavedClusterSnapshot {
+    /// JSON-encoded `ClusterManifest` (`ClusterManifest` contains `serde_json::Value`,
+    /// which requires a self-describing format rather than bincode).
+    manifest_json: String,
+    keyframes: Vec<ClusterKeyframe>,
+    node_encoders: Vec<NodeEncoders>,
+    node_kf_parents: Vec<Option<u64>>,
+    node_kf_boots: Vec<u32>,
+    next_kf_ns: u64,
+    /// JSON-encoded `Vec<ScheduledFault>` (`FaultKind` uses tagged serde).
+    recorded_faults_json: String,
+    node_records: Vec<Vec<(u64, Vec<u8>)>>,
+    /// JSON-encoded `Vec<NetEvent>` (`NetEvent` uses tagged serde).
+    net_events_json: String,
+    statuses: Vec<Option<i32>>,
+    buffers: Vec<NodeBuffers>,
+    cluster_ns: u64,
+    cluster_step: u64,
+}
+
+fn encode_saved_snapshot(snap: &SavedClusterSnapshot) -> Result<Vec<u8>> {
+    let mut out = SAVED_SNAP_MAGIC.to_vec();
+    out.extend_from_slice(&SAVED_SNAP_VERSION.to_le_bytes());
+    out.extend_from_slice(&bincode::serialize(snap)?);
+    Ok(out)
+}
+
+fn decode_saved_snapshot(bytes: &[u8]) -> Result<SavedClusterSnapshot> {
+    let hdr = SAVED_SNAP_MAGIC.len() + 4;
+    if bytes.len() < hdr || &bytes[..SAVED_SNAP_MAGIC.len()] != SAVED_SNAP_MAGIC {
+        bail!("not a valid rewind cluster snapshot file");
+    }
+    let version = u32::from_le_bytes(
+        bytes[SAVED_SNAP_MAGIC.len()..hdr]
+            .try_into()
+            .expect("four bytes"),
+    );
+    if version != SAVED_SNAP_VERSION {
+        bail!("unsupported cluster snapshot version {version} (expected {SAVED_SNAP_VERSION})");
+    }
+    Ok(bincode::deserialize(&bytes[hdr..])?)
+}
+
 /// Per-node live snapshot returned by `status` / `advance`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct NodeStatus {
@@ -523,6 +574,86 @@ impl ClusterSession {
             node_kf_parents: vec![None; n_count],
             node_kf_boots: vec![1; n_count],
             next_kf_ns: CLUSTER_KEYFRAME_INTERVAL_NS,
+            snapshots: HashMap::new(),
+            next_snap_id: 1,
+            last_stop: ClusterStop::Paused,
+            finished: false,
+        })
+    }
+
+    /// Starts a new independent interactive cluster session directly from a
+    /// saved snapshot file produced by [`ClusterSession::save_snapshot`].
+    ///
+    /// Safe to invoke concurrently from many processes sharing `home.store()`,
+    /// enabling parallel fan-out of tests or chaos branches from one warm setup.
+    pub fn start_from_snapshot(
+        home: Home,
+        path: &Path,
+        name_override: Option<String>,
+        keyframes_mode: Keyframes,
+        echo: bool,
+    ) -> Result<ClusterSession> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("reading cluster snapshot {}", path.display()))?;
+        let saved = decode_saved_snapshot(&bytes)?;
+        let mut manifest: rewind_trace::cluster::ClusterManifest =
+            serde_json::from_str(&saved.manifest_json)
+                .context("decoding cluster manifest from saved snapshot")?;
+        let recorded_faults: Vec<ScheduledFault> =
+            serde_json::from_str(&saved.recorded_faults_json)
+                .context("decoding recorded faults from saved snapshot")?;
+        let net_events: Vec<NetEvent> = serde_json::from_str(&saved.net_events_json)
+            .context("decoding network events from saved snapshot")?;
+        if let Some(name) = name_override {
+            manifest.name = name;
+        }
+        let cluster_config = config_from_manifest(&manifest)?;
+        let store = Store::open(&home.store())?;
+        let pages = ReadPages(&store);
+        let mut cluster = Cluster::restore(
+            cluster_config.clone(),
+            &saved.keyframes,
+            &pages,
+            &saved.node_records,
+            DirtyLog::On,
+        )?;
+        cluster.set_node_encoders(&saved.node_encoders);
+
+        let node_names: Vec<String> = manifest.nodes.iter().map(|n| n.name.clone()).collect();
+        let name_to_idx: HashMap<String, usize> = node_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        let recorder = SessionRecorder {
+            node_names: node_names.clone(),
+            node_records: saved.node_records,
+            net_events,
+            statuses: saved.statuses,
+            buffers: saved.buffers,
+            echo,
+        };
+        let prepared = PreparedCluster {
+            id: manifest.id.clone(),
+            manifest,
+            cluster_config,
+        };
+
+        Ok(ClusterSession {
+            home,
+            prepared,
+            cluster,
+            store: Some(store),
+            keyframes_mode,
+            started: Instant::now(),
+            node_names,
+            name_to_idx,
+            recorder,
+            recorded_faults,
+            keyframes: saved.keyframes,
+            node_kf_parents: saved.node_kf_parents,
+            node_kf_boots: saved.node_kf_boots,
+            next_kf_ns: saved.next_kf_ns,
             snapshots: HashMap::new(),
             next_snap_id: 1,
             last_stop: ClusterStop::Paused,
@@ -1089,6 +1220,62 @@ impl ClusterSession {
         let step = snap.cluster_step;
         self.snapshots.insert(label.clone(), snap);
         Ok((label, ns, step))
+    }
+
+    /// Exports a named (or newly captured) whole-cluster snapshot to `path` so
+    /// independent parallel worker processes can start directly from it via
+    /// [`ClusterSession::start_from_snapshot`]. Guest RAM pages remain
+    /// deduplicated in `home.store()`; only compact metadata & trace prefixes
+    /// are written to `path`.
+    pub fn save_snapshot(
+        &mut self,
+        name: Option<String>,
+        path: &Path,
+    ) -> Result<(String, u64, u64)> {
+        let label = match name {
+            Some(ref existing) if self.snapshots.contains_key(existing) => existing.clone(),
+            other => self.snapshot(other)?.0,
+        };
+        if let Some(store) = self.store.as_ref() {
+            store.sync()?;
+        }
+        let snap = self
+            .snapshots
+            .get(&label)
+            .with_context(|| format!("unknown cluster snapshot {label:?}"))?;
+        let node_records: Vec<Vec<(u64, Vec<u8>)>> = self
+            .recorder
+            .node_records
+            .iter()
+            .zip(snap.node_records_lens.iter())
+            .map(|(recs, &len)| recs[..len.min(recs.len())].to_vec())
+            .collect();
+        let net_events = self.recorder.net_events
+            [..snap.net_events_len.min(self.recorder.net_events.len())]
+            .to_vec();
+        let saved = SavedClusterSnapshot {
+            manifest_json: serde_json::to_string(&self.prepared.manifest)?,
+            keyframes: snap.keyframes.clone(),
+            node_encoders: snap.node_encoders.clone(),
+            node_kf_parents: snap.node_kf_parents.clone(),
+            node_kf_boots: snap.node_kf_boots.clone(),
+            next_kf_ns: snap.next_kf_ns,
+            recorded_faults_json: serde_json::to_string(&snap.recorded_faults)?,
+            node_records,
+            net_events_json: serde_json::to_string(&net_events)?,
+            statuses: snap.statuses.clone(),
+            buffers: snap.buffers.clone(),
+            cluster_ns: snap.cluster_ns,
+            cluster_step: snap.cluster_step,
+        };
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let encoded = encode_saved_snapshot(&saved)?;
+        crate::image::write_atomic(path, &encoded)?;
+        Ok((label, snap.cluster_ns, snap.cluster_step))
     }
 
     /// Rewinds the entire live cluster back to a previously captured named
