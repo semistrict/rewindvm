@@ -25,6 +25,7 @@ EROFS images via `REWIND_POSTGRES_EROFS`, `REWIND_UMAMI_EROFS`, and
 
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -74,11 +75,39 @@ SPECS = [
 ]
 
 
+def run_one_spec(cluster: Cluster, spec: str) -> dict:
+    t0 = time.perf_counter()
+    browser = cluster.node("browser")
+    browser.send_input(f"{spec}\n")
+
+    if spec == "db_partition_and_recover":
+        browser.wait_for("READY_FOR_DB_FAULT", from_start=True, timeout_ms=30_000)
+        cluster.partition(["db"], ["app", "browser"])
+        browser.send_input("PARTITIONED\n")
+        browser.wait_for("DB_FAULT_OBSERVED", from_start=True, timeout_ms=30_000)
+        cluster.heal()
+        browser.send_input("HEALED\n")
+
+    browser.wait_for(f"PASS:{spec}", from_start=True, timeout_ms=60_000)
+    exit_res = browser.wait_exit(timeout_ms=30_000)
+    assert exit_res["exit_code"] == 0, f"{spec}: browser exited with {exit_res}"
+    run = cluster.finish(verdict="passed")
+    return {
+        "spec": spec,
+        "run_id": run["id"],
+        "wall_s": time.perf_counter() - t0,
+        "cluster_ms": exit_res["cluster_ns"] / 1e6,
+    }
+
+
 def main() -> None:
     pg_erofs = os.environ.get("REWIND_POSTGRES_EROFS")
     umami_erofs = os.environ.get("REWIND_UMAMI_EROFS")
     pw_erofs = os.environ.get("REWIND_PLAYWRIGHT_EROFS")
     display = os.environ.get("REWIND_DISPLAY", "1") not in ("0", "false", "no", "off")
+    parallel_specs = "--parallel" in sys.argv or os.environ.get(
+        "REWIND_PARALLEL_SPECS", "0"
+    ) in ("1", "true", "yes", "on")
 
     t0 = time.perf_counter()
     with Cluster(
@@ -178,6 +207,40 @@ def main() -> None:
                 flush=True,
             )
 
+            if parallel_specs:
+                with tempfile.TemporaryDirectory(prefix="rewind-umami-snap-") as tmp:
+                    snap_path = Path(tmp) / "logged-in.rwcsnap"
+                    t_save0 = time.perf_counter()
+                    c.save_snapshot(snap_path, name=snap)
+                    t_save = time.perf_counter() - t_save0
+                    # Close the setup cluster before fanning out N parallel clusters so
+                    # all host cores and memory go directly to the parallel workers.
+                    c.close()
+
+                    t_fan0 = time.perf_counter()
+                    results = Cluster.fan_out(
+                        snap_path,
+                        SPECS,
+                        run_one_spec,
+                        max_workers=int(os.environ.get("REWIND_FANOUT_WORKERS", str(len(SPECS)))),
+                        name_prefix="umami",
+                    )
+                    t_fan = time.perf_counter() - t_fan0
+                    sum_s = sum(r["wall_s"] for _, r in results)
+                    for spec, r in results:
+                        print(
+                            f"[parallel] {spec:26s} PASS  "
+                            f"(run={r['wall_s']:5.2f}s, vtime={r['cluster_ms']:.1f}ms, id={r['run_id']})",
+                            flush=True,
+                        )
+                    print(
+                        f"fan-out {len(SPECS)} parallel 3-VM clusters ({len(SPECS)*3} VMs) "
+                        f"finished in {t_fan:.2f}s wall (sum={sum_s:.2f}s, "
+                        f"{sum_s / t_fan:.2f}x speedup, save_snapshot={t_save*1000:.1f}ms)",
+                        flush=True,
+                    )
+                return
+
             restore_times = []
             for spec in SPECS:
                 t_r0 = time.perf_counter()
@@ -209,7 +272,7 @@ def main() -> None:
 
             exit_res = browser.wait_exit(timeout_ms=30_000)
             assert exit_res["exit_code"] == 0, f"browser exited with {exit_res}"
-            run = c.finish(verdict=True)
+            run = c.finish(verdict="passed")
             avg_restore = sum(restore_times) / len(restore_times) * 1000
             vtime_ms = exit_res["cluster_ns"] / 1e6
             print(
@@ -219,10 +282,11 @@ def main() -> None:
                 flush=True,
             )
         except Exception:
-            for name, h in [("db", db), ("app", app), ("browser", browser)]:
-                print(f"\n=== {name} output (tail) ===", file=sys.stderr)
-                for line in h.logs(stream="output")[-30:]:
-                    print(line, file=sys.stderr)
+            if c._started:
+                for name, h in [("db", db), ("app", app), ("browser", browser)]:
+                    print(f"\n=== {name} output (tail) ===", file=sys.stderr)
+                    for line in h.logs(stream="output")[-30:]:
+                        print(line, file=sys.stderr)
             raise
 
 
