@@ -14,9 +14,29 @@ runs three real-world scenarios:
   2. `globalconfig-crash` — FoundationDB commit `f8e1e90a40` (PR #14196):
      4-VM cluster (`fdb1..fdb3` + `client`). Writes an empty value to
      `\\xff/globalConfig/v` and catches the heap OOB read / assertion crash
-     across GRV proxies in unmodified FDB 8.0.1.
+     across ClusterController/GRV proxies in unmodified FDB 8.0.1.
 
-  3. `reboot-chaos` — Multi-fault recovery & multi-boot trace verification:
+  3. `stale-coordinator-dns` — FoundationDB commit `1915da14fc` (PR #14328):
+     4-VM cluster (`fdb1..fdb3` + `libfdb_c.so` multi-version client). Opens
+     databases using a connection string mixing the 3 live coordinators with
+     stale `.invalid` coordinator hostnames and catches `getClusterProtocolImpl`
+     wedging in `resolveWithRetry()` (error 1031 `transaction_timed_out`) even
+     while the cluster is 100% healthy.
+
+  4. `peek-timeout-clog` — FoundationDB commit `446079cc6a` (PR #13248):
+     6-VM cluster (`fdb1..fdb5` + `client`). Runs non-streaming peeks
+     (`--knob_peek_using_streaming=0`), clogs TLog <-> Storage Server links via
+     `c.clog_link()`, and compares `--knob_peek_reply_timeout=0` (pre-fix
+     wait-forever) against `--knob_peek_reply_timeout=2` (post-fix sender-side
+     peek retries observed directly on Rewind's virtual switch).
+
+  5. `subnet-prefix-bypass` — FoundationDB commit `be737227dc`:
+     4-VM cluster (`fdb1..fdb3` + `client`). Starts `fdbserver` with invalid
+     `--trusted-subnet-1` CIDR prefixes (`/-1`, `/33`, `/8junk`) and proves
+     unmodified FDB 8.0.1 accepts them instead of rejecting with `invalid_option`
+     (turning `/-1` into `0.0.0.0/0` and overflowing the 4-byte mask on `/33`).
+
+  6. `reboot-chaos` — Multi-fault recovery & multi-boot trace verification:
      6-VM cluster (`fdb1..fdb5` + `client`). Injects link clogging, vCPU
      pause/resume, forward clock step + drift, and same-IP TLog crash + restart,
      verifying post-fault transactional continuity and multi-boot replay.
@@ -27,6 +47,9 @@ Build the EROFS root image once via:
 Then run:
     python3 examples/cluster/foundationdb_sim.py --scenario stale-peer
     python3 examples/cluster/foundationdb_sim.py --scenario globalconfig-crash
+    python3 examples/cluster/foundationdb_sim.py --scenario stale-coordinator-dns
+    python3 examples/cluster/foundationdb_sim.py --scenario peek-timeout-clog
+    python3 examples/cluster/foundationdb_sim.py --scenario subnet-prefix-bypass
     python3 examples/cluster/foundationdb_sim.py --scenario reboot-chaos
     python3 examples/cluster/foundationdb_sim.py --scenario all --replay
 """
@@ -429,13 +452,332 @@ async def scenario_reboot_chaos(fdb_erofs: str, *, verify_replay: bool) -> dict:
         }
 
 
+async def scenario_stale_coordinator_dns(
+    fdb_erofs: str, *, verify_replay: bool
+) -> dict:
+    files = guest_files("stale_coord_dns_client.py")
+
+    async with Cluster(
+        "fdb-bug-1915da14fc",
+        latency_ms=1,
+        mem_mib=512,
+        stop_when="driver",
+        max_virtual_ms=90_000,
+        slice_us=500,
+        keyframes=False,
+    ) as c:
+        for i in range(1, 4):
+            c.add_node(
+                f"fdb{i}",
+                [
+                    "/bin/sh",
+                    "/build/run_fdb.sh",
+                    f"10.0.0.{i}",
+                    f"az-{i}",
+                    f"fdb{i}",
+                    "unset",
+                ],
+                ip=f"10.0.0.{i}",
+                role="service",
+                zone=f"az-{i}",
+                root=fdb_erofs,
+                files=files,
+            )
+        client = c.add_node(
+            "client",
+            ["python3", "-u", "/build/stale_coord_dns_client.py"],
+            ip="10.0.0.10",
+            role="driver",
+            mem_mib=256,
+            root=fdb_erofs,
+            files=files,
+        )
+
+        await c.start()
+        cfg = await c.wait_signal(
+            names=["configured", "configure-failed"], timeout_ms=30_000
+        )
+        assert cfg is not None and cfg.name == "configured", cfg
+        done = await c.wait_signal("done", timeout_ms=60_000)
+        assert done is not None
+        info = done.json()
+
+        await client.wait_exit(timeout_ms=10_000)
+        run = await c.finish(verdict="passed")
+
+        replay_ok = None
+        if verify_replay:
+            rep = await c.replay(machine="none")
+            assert rep["identical"] is True, rep
+            replay_ok = {
+                "identical": True,
+                "total_events": rep["total_events"],
+                "net_events": rep["net_events"],
+            }
+
+        assert info["clean_err"] == 0, info
+        assert info["stuck_timeout_1031"] > 0, info
+        print(
+            f"[stale-coordinator-dns] clean_err={info['clean_err']} "
+            f"stuck_timeout_1031={info['stuck_timeout_1031']}/{info['total_stale_dbs']} "
+            f"wall={run['outcome']['wall_ms']}ms (cluster {run['id']})"
+            + (" replay=IDENTICAL" if replay_ok else ""),
+            flush=True,
+        )
+        return {
+            "cluster_id": run["id"],
+            **info,
+            "wall_ms": run["outcome"]["wall_ms"],
+            "replay": replay_ok,
+        }
+
+
+async def run_peek_timeout_trial(
+    fdb_erofs: str, label: str, peek_timeout: int, *, verify_replay: bool
+) -> dict:
+    files = guest_files("peek_timeout_client.py")
+
+    async with Cluster(
+        f"fdb-bug-446079cc6a-{label}",
+        latency_ms=1,
+        mem_mib=512,
+        stop_when="driver",
+        max_virtual_ms=120_000,
+        slice_us=500,
+        keyframes=False,
+    ) as c:
+        specs = [
+            ("fdb1", "10.0.0.1", "az-1", "stateless"),
+            ("fdb2", "10.0.0.2", "az-2", "log"),
+            ("fdb3", "10.0.0.3", "az-3", "log"),
+            ("fdb4", "10.0.0.4", "az-4", "storage"),
+            ("fdb5", "10.0.0.5", "az-5", "storage"),
+        ]
+        for name, ip, zone, cls in specs:
+            c.add_node(
+                name,
+                [
+                    "/bin/sh",
+                    "/build/run_fdb.sh",
+                    ip,
+                    zone,
+                    name,
+                    cls,
+                    "--knob_peek_using_streaming=0",
+                    f"--knob_peek_reply_timeout={peek_timeout}",
+                ],
+                ip=ip,
+                role="service",
+                zone=zone,
+                root=fdb_erofs,
+                files=files,
+            )
+        client = c.add_node(
+            "client",
+            ["python3", "-u", "/build/peek_timeout_client.py"],
+            ip="10.0.0.10",
+            role="driver",
+            mem_mib=256,
+            root=fdb_erofs,
+            files=files,
+        )
+
+        await c.start()
+        cfg = await c.wait_signal(
+            names=["configured", "configure-failed"], timeout_ms=30_000
+        )
+        assert cfg is not None and cfg.name == "configured", cfg
+        await c.wait_signal("warmed-up", timeout_ms=20_000)
+        await c.wait_signal("clogged", node="client", barrier=True, timeout_ms=10_000)
+
+        # Clog both TLogs <-> Storage Server fdb4 for 15s VT so fdb4's ServerPeekCursor
+        # sits waiting for a TLogPeekReply that cannot arrive until unclogged.
+        clog_res = await c.clog_link("fdb2", "fdb4", duration_ms=15_000)
+        await c.clog_link("fdb3", "fdb4", duration_ms=15_000)
+        clog_ms = int(clog_res["cluster_ns"] / 1_000_000)
+        await c.release("clogged")
+
+        await c.wait_signal("clog-phase-done", timeout_ms=45_000)
+        await c.wait_signal("unclogged", node="client", barrier=True, timeout_ms=10_000)
+        unclog_res = await c.unclog()
+        unclog_ms = int(unclog_res["cluster_ns"] / 1_000_000)
+        await c.release("unclogged")
+
+        done = await c.wait_signal("done", timeout_ms=30_000)
+        assert done is not None
+
+        # Measure TX bytes sent by Storage Server fdb4 to TLogs (10.0.0.2 / 10.0.0.3)
+        # across the clogged + flush window [clog_ms + 1.5s, unclog_ms + 0.2s]:
+        # with peek_reply_timeout=2, fdb4 re-sends TLogPeekRequest RPCs while clogged
+        # (buffered by TCP and flushed on unclog, adding +172 B per retry); with
+        # peek_reply_timeout=0, it sits silent without retrying.
+        clog_events = (
+            await c.net_events(
+                node="fdb4", from_ms=clog_ms + 1_500, to_ms=unclog_ms + 200
+            )
+        )["events"]
+        tlog_tx = [
+            e
+            for e in clog_events
+            if e.get("type") == "tx"
+            and (
+                "10.0.0.2:4500" in e.get("summary", "")
+                or "10.0.0.3:4500" in e.get("summary", "")
+            )
+        ]
+        tlog_tx_bytes = sum(int(e.get("len", 0)) for e in tlog_tx)
+
+        await client.wait_exit(timeout_ms=10_000)
+        run = await c.finish(verdict="passed")
+
+        replay_ok = None
+        if verify_replay:
+            rep = await c.replay(machine="none")
+            assert rep["identical"] is True, rep
+            replay_ok = {
+                "identical": True,
+                "total_events": rep["total_events"],
+                "net_events": rep["net_events"],
+            }
+
+        print(
+            f"[peek-timeout-clog:{label}] fdb4_tlog_tx_bytes={tlog_tx_bytes} "
+            f"(frames={len(tlog_tx)}) post_ok={done.json()['post_ok']} "
+            f"wall={run['outcome']['wall_ms']}ms (cluster {run['id']})"
+            + (" replay=IDENTICAL" if replay_ok else ""),
+            flush=True,
+        )
+        return {
+            "label": label,
+            "peek_reply_timeout_knob": peek_timeout,
+            "fdb4_tlog_tx_frames": len(tlog_tx),
+            "fdb4_tlog_tx_bytes": tlog_tx_bytes,
+            "post_ok": done.json()["post_ok"],
+            "cluster_id": run["id"],
+            "wall_ms": run["outcome"]["wall_ms"],
+            "replay": replay_ok,
+        }
+
+
+async def scenario_peek_timeout_clog(
+    fdb_erofs: str, *, verify_replay: bool
+) -> dict:
+    buggy = await run_peek_timeout_trial(
+        fdb_erofs, "buggy-timeout0", 0, verify_replay=verify_replay
+    )
+    fixed = await run_peek_timeout_trial(
+        fdb_erofs, "fixed-timeout2", 2, verify_replay=verify_replay
+    )
+    assert fixed["fdb4_tlog_tx_bytes"] > buggy["fdb4_tlog_tx_bytes"], (
+        buggy,
+        fixed,
+    )
+    assert fixed["post_ok"] is True, fixed
+    return {
+        "buggy": buggy,
+        "fixed": fixed,
+        "extra_retry_bytes": fixed["fdb4_tlog_tx_bytes"] - buggy["fdb4_tlog_tx_bytes"],
+    }
+
+
+async def scenario_subnet_prefix_bypass(
+    fdb_erofs: str, *, verify_replay: bool
+) -> dict:
+    files = guest_files("subnet_prefix_client.py")
+
+    async with Cluster(
+        "fdb-bug-be737227dc",
+        latency_ms=1,
+        mem_mib=512,
+        stop_when="driver",
+        max_virtual_ms=60_000,
+        slice_us=500,
+        keyframes=False,
+    ) as c:
+        for i in range(1, 4):
+            extra = ["--trusted-subnet-1=10.0.0.1/-1"] if i == 1 else []
+            c.add_node(
+                f"fdb{i}",
+                [
+                    "/bin/sh",
+                    "/build/run_fdb.sh",
+                    f"10.0.0.{i}",
+                    f"az-{i}",
+                    f"fdb{i}",
+                    "unset",
+                    *extra,
+                ],
+                ip=f"10.0.0.{i}",
+                role="service",
+                zone=f"az-{i}",
+                root=fdb_erofs,
+                files=files,
+            )
+        client = c.add_node(
+            "client",
+            ["python3", "-u", "/build/subnet_prefix_client.py"],
+            ip="10.0.0.10",
+            role="driver",
+            mem_mib=256,
+            root=fdb_erofs,
+            files=files,
+        )
+
+        await c.start()
+        cfg = await c.wait_signal(
+            names=["configured", "configure-failed"], timeout_ms=30_000
+        )
+        assert cfg is not None and cfg.name == "configured", cfg
+        done = await c.wait_signal("done", timeout_ms=30_000)
+        assert done is not None
+        info = done.json()
+
+        await client.wait_exit(timeout_ms=10_000)
+        run = await c.finish(verdict="passed")
+
+        replay_ok = None
+        if verify_replay:
+            rep = await c.replay(machine="none")
+            assert rep["identical"] is True, rep
+            replay_ok = {
+                "identical": True,
+                "total_events": rep["total_events"],
+                "net_events": rep["net_events"],
+            }
+
+        accepted = [p["subnet"] for p in info["probes"] if p["accepted"]]
+        assert info["cluster_with_neg1_subnet_ok"] is True, info
+        assert len(accepted) == len(info["probes"]), info
+        print(
+            f"[subnet-prefix-bypass] fdb1 accepted --trusted-subnet-1=10.0.0.1/-1 "
+            f"& all {len(accepted)} invalid CIDRs accepted: {accepted} "
+            f"wall={run['outcome']['wall_ms']}ms (cluster {run['id']})"
+            + (" replay=IDENTICAL" if replay_ok else ""),
+            flush=True,
+        )
+        return {
+            "cluster_id": run["id"],
+            **info,
+            "wall_ms": run["outcome"]["wall_ms"],
+            "replay": replay_ok,
+        }
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run FoundationDB 8.0.1 deterministic simulation examples in Rewind VM."
     )
     parser.add_argument(
         "--scenario",
-        choices=["stale-peer", "globalconfig-crash", "reboot-chaos", "all"],
+        choices=[
+            "stale-peer",
+            "globalconfig-crash",
+            "stale-coordinator-dns",
+            "peek-timeout-clog",
+            "subnet-prefix-bypass",
+            "reboot-chaos",
+            "all",
+        ],
         default="stale-peer",
         help="Scenario to run (default: stale-peer).",
     )
@@ -454,6 +796,18 @@ async def main() -> None:
         )
     if args.scenario in ("globalconfig-crash", "all"):
         summary["globalconfig-crash"] = await scenario_globalconfig_crash(
+            fdb_erofs, verify_replay=args.replay
+        )
+    if args.scenario in ("stale-coordinator-dns", "all"):
+        summary["stale-coordinator-dns"] = await scenario_stale_coordinator_dns(
+            fdb_erofs, verify_replay=args.replay
+        )
+    if args.scenario in ("peek-timeout-clog", "all"):
+        summary["peek-timeout-clog"] = await scenario_peek_timeout_clog(
+            fdb_erofs, verify_replay=args.replay
+        )
+    if args.scenario in ("subnet-prefix-bypass", "all"):
+        summary["subnet-prefix-bypass"] = await scenario_subnet_prefix_bypass(
             fdb_erofs, verify_replay=args.replay
         )
     if args.scenario in ("reboot-chaos", "all"):
