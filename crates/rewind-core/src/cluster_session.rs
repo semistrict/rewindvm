@@ -38,7 +38,8 @@ use rewind_vmm::net::{
 use crate::cluster::{
     CLUSTER_KEYFRAME_INTERVAL_NS, ClusterRun, ClusterRunOptions, PreparedCluster,
     compute_cluster_id, compute_node_parents, config_from_manifest, format_reason,
-    judge_cluster_node, parse_role, parse_stop_when, prepare_cluster, save_cluster_keyframe,
+    judge_cluster_node, pack_bgr0_frame, parse_role, parse_stop_when, prepare_cluster,
+    save_cluster_keyframe, write_bgr0_image,
 };
 use crate::home::{Guest, Home};
 use crate::inspect::{Inspection, cat_on_machine, list_on_machine};
@@ -638,6 +639,17 @@ pub struct WaitExitResult {
     pub exit_code: Option<i32>,
     pub cluster_ns: u64,
     pub cluster_step: u64,
+}
+
+/// Result of `ClusterSession::screenshot`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ScreenshotResult {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub cluster_ns: u64,
+    pub cluster_step: u64,
+    pub non_blank: bool,
 }
 
 /// Result of `ClusterSession::cat`.
@@ -1530,6 +1542,45 @@ impl ClusterSession {
             Vec::new()
         };
         (slice, total)
+    }
+
+    /// Reads a node's live paravirtual framebuffer directly from guest RAM
+    /// (zero perturbation) and writes it to `out_path` (`.png`, `.bmp`, `.ppm`,
+    /// `.raw`/`.bgr0`, `.jpg`, `.webp`).
+    pub fn screenshot(
+        &mut self,
+        node: &str,
+        out_path: &Path,
+        timestamp_overlay: bool,
+        input_overlay: bool,
+    ) -> Result<ScreenshotResult> {
+        let idx = self.node_index(node)?;
+        let Some((info, pixels)) = self.cluster.read_node_framebuffer(idx)? else {
+            bail!(
+                "node {node:?} was started without display=true (no paravirtual framebuffer)"
+            );
+        };
+        let mut scratch = Vec::new();
+        pack_bgr0_frame(info.width, info.height, info.stride, &pixels, &mut scratch);
+        let non_blank = scratch.iter().any(|&b| b != 0);
+        let now_ns = self.cluster.cluster_ns();
+        if input_overlay {
+            let mut overlay =
+                crate::video_overlay::HidOverlay::from_faults(&self.recorded_faults, idx);
+            overlay.draw(&mut scratch, info.width, info.height, now_ns);
+        }
+        if timestamp_overlay {
+            crate::video_overlay::draw_timestamp_hud(&mut scratch, info.width, info.height, now_ns);
+        }
+        write_bgr0_image(out_path, info.width, info.height, &scratch)?;
+        Ok(ScreenshotResult {
+            path: out_path.display().to_string(),
+            width: info.width,
+            height: info.height,
+            cluster_ns: now_ns,
+            cluster_step: self.cluster.cluster_step(),
+            non_blank,
+        })
     }
 
     /// Reads a file from a live node's filesystem via a non-destructive VM

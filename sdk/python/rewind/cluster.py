@@ -611,6 +611,62 @@ class Cluster:
             raise FileNotFoundError(res.get("error") or f"{node}:{path} not found")
         return res["entries"]
 
+    async def screenshot(
+        self,
+        node: str,
+        path: Union[str, os.PathLike[str]],
+        *,
+        timestamp: bool = False,
+        show_input: bool = False,
+    ) -> Dict[str, Any]:
+        """Captures ``node``'s live framebuffer directly to ``path`` on disk.
+
+        Supports zero-dependency ``.bmp``, ``.ppm``, ``.raw``/``.bgr0`` as well
+        as ``.png``/``.jpg``/``.webp`` (encoded via ``ffmpeg``). Never pipes
+        bulk image bytes over JSON-RPC.
+        """
+        return await self._rpc.call(
+            "cluster.screenshot",
+            {
+                "node": node,
+                "path": os.fspath(path),
+                "timestamp": timestamp,
+                "show_input": show_input,
+            },
+        )
+
+    async def export_video(
+        self,
+        node: str,
+        path: Union[str, os.PathLike[str]],
+        *,
+        fps: int = 30,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+        timestamp: bool = False,
+        show_input: bool = False,
+        cluster: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Exports a retroactive screencast (``.mp4``, ``.webm``, ``.gif``, ``.png``,
+        or ``.raw``) of ``node`` directly to ``path`` on disk.
+
+        Call after :meth:`finish` (or pass ``cluster`` to export any recorded run).
+        """
+        params: Dict[str, Any] = {
+            "node": node,
+            "path": os.fspath(path),
+            "fps": fps,
+            "timestamp": timestamp,
+            "show_input": show_input,
+        }
+        if from_ms is not None:
+            params["from_ms"] = from_ms
+        if to_ms is not None:
+            params["to_ms"] = to_ms
+        if cluster is not None:
+            params["cluster"] = cluster
+        return await self._rpc.call("cluster.export_video", params)
+
     async def snapshot(self, name: Optional[str] = None) -> str:
         params = {"name": name} if name is not None else {}
         res = await self._rpc.call("cluster.snapshot", params)

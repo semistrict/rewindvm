@@ -69,6 +69,7 @@ pub fn serve_stream<R: BufRead, W: Write>(
     defaults: &ServeDefaults,
 ) -> Result<()> {
     let mut session: Option<ClusterSession> = None;
+    let mut last_finished_dir: Option<PathBuf> = None;
 
     for line_res in reader.lines() {
         let line = line_res?;
@@ -95,7 +96,13 @@ pub fn serve_stream<R: BufRead, W: Write>(
         };
 
         let is_shutdown = req.method == "shutdown";
-        let resp = match dispatch(&req.method, req.params, &mut session, defaults) {
+        let resp = match dispatch(
+            &req.method,
+            req.params,
+            &mut session,
+            &mut last_finished_dir,
+            defaults,
+        ) {
             Ok(val) => RpcResponse {
                 jsonrpc: "2.0",
                 id: req.id,
@@ -224,12 +231,14 @@ fn dispatch(
     method: &str,
     params: Value,
     session: &mut Option<ClusterSession>,
+    last_finished_dir: &mut Option<PathBuf>,
     defaults: &ServeDefaults,
 ) -> Result<Value> {
     match method {
         "ping" => Ok(json!({ "ok": true, "version": crate::VERSION })),
         "shutdown" => {
             *session = None;
+            *last_finished_dir = None;
             Ok(json!({ "ok": true }))
         }
         "cluster.start" => {
@@ -309,6 +318,8 @@ fn dispatch(
                 parent: None,
             };
 
+            *session = None;
+            *last_finished_dir = None;
             let s = ClusterSession::start(
                 defaults.home.clone(),
                 &defaults.guest,
@@ -694,6 +705,80 @@ fn dispatch(
             let s = require_session(session)?;
             Ok(serde_json::to_value(s.files(&p.node, &p.path, p.pid)?)?)
         }
+        "cluster.screenshot" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                path: PathBuf,
+                #[serde(default)]
+                timestamp: bool,
+                #[serde(default)]
+                show_input: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.screenshot")?;
+            let resolved = if p.path.is_absolute() {
+                p.path
+            } else {
+                defaults.workdir.join(p.path)
+            };
+            let s = require_session(session)?;
+            Ok(serde_json::to_value(s.screenshot(
+                &p.node,
+                &resolved,
+                p.timestamp,
+                p.show_input,
+            )?)?)
+        }
+        "cluster.export_video" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                path: PathBuf,
+                #[serde(default)]
+                cluster: Option<String>,
+                fps: Option<u32>,
+                from_ms: Option<u64>,
+                to_ms: Option<u64>,
+                #[serde(default)]
+                timestamp: bool,
+                #[serde(default)]
+                show_input: bool,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.export_video")?;
+            let resolved = if p.path.is_absolute() {
+                p.path
+            } else {
+                defaults.workdir.join(p.path)
+            };
+            let opts = crate::cluster::VideoExportOptions {
+                fps: p.fps.unwrap_or(30),
+                from_ms: p.from_ms,
+                to_ms: p.to_ms,
+                timestamp_overlay: p.timestamp,
+                input_overlay: p.show_input,
+            };
+            let run = if let Some(cluster_q) = p.cluster.as_deref() {
+                crate::cluster::ClusterRun::find(&defaults.home, cluster_q)?
+            } else {
+                let dir = last_finished_dir
+                    .as_deref()
+                    .context("call cluster.finish() before cluster.export_video()")?;
+                crate::cluster::ClusterRun::open(dir)?
+            };
+            let stats = run.export_video(&defaults.home, &p.node, &resolved, &opts)?;
+            Ok(json!({
+                "path": resolved.display().to_string(),
+                "frames": stats.frames,
+                "width": stats.width,
+                "height": stats.height,
+                "fps": stats.fps,
+                "from_ns": stats.from_ns,
+                "to_ns": stats.to_ns,
+                "non_blank_frames": stats.non_blank_frames,
+            }))
+        }
         "cluster.snapshot" => {
             #[derive(Deserialize, Default)]
             struct P {
@@ -754,6 +839,8 @@ fn dispatch(
             } else {
                 Keyframes::Skip
             };
+            *session = None;
+            *last_finished_dir = None;
             let s = ClusterSession::start_from_snapshot(
                 defaults.home.clone(),
                 &resolved,
@@ -795,6 +882,12 @@ fn dispatch(
             let s = require_session(session)?;
             let run = s.finish(verdict_override, p.reason)?;
             let outcome = run.manifest.outcome.clone();
+            // Drop the live ClusterSession (and its HVF/KVM VMs) now that the
+            // run is persisted on disk so subsequent `cluster.export_video` or
+            // `cluster.start` calls can boot a fresh VM cleanly (macOS HVF
+            // permits only one VM per process).
+            *last_finished_dir = Some(run.dir);
+            *session = None;
             Ok(json!({
                 "id": run.manifest.id.as_str(),
                 "name": run.manifest.name,

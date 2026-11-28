@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .types import SignalEvent, WaitResult
@@ -152,6 +153,39 @@ class NodeHandle:
         self, path: str, *, pid: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         return await self._cluster.files(self.name, path, pid=pid)
+
+    async def screenshot(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        timestamp: bool = False,
+        show_input: bool = False,
+    ) -> Dict[str, Any]:
+        """Captures this node's live framebuffer directly to ``path`` on disk."""
+        return await self._cluster.screenshot(
+            self.name, path, timestamp=timestamp, show_input=show_input
+        )
+
+    async def export_video(
+        self,
+        path: Union[str, os.PathLike[str]],
+        *,
+        fps: int = 30,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+        timestamp: bool = False,
+        show_input: bool = False,
+    ) -> Dict[str, Any]:
+        """Exports a retroactive screencast of this node directly to ``path`` on disk."""
+        return await self._cluster.export_video(
+            self.name,
+            path,
+            fps=fps,
+            from_ms=from_ms,
+            to_ms=to_ms,
+            timestamp=timestamp,
+            show_input=show_input,
+        )
 
     async def logs(self, *, stream: str = "output", since: int = 0) -> List[str]:
         return (await self._cluster.logs(self.name, stream=stream, since=since))[
