@@ -5,6 +5,8 @@ reproducing Kyle Kingsbury's December 8, 2025 Jepsen NATS 2.12.1 analysis.
 
 Cluster layout (4 VMs on Rewind's deterministic L2 virtual switch):
   - `n1`, `n2`, `n3` (10.0.0.1..3): unmodified NATS 2.12.1 JetStream cluster
+                                    backed by persistent crash-consistent ext4
+                                    disks (`/dev/rwd0` mounted at `/data`)
   - `control`        (10.0.0.10):   OpenJDK 21 + AOT Jepsen uberjar with
                                     `jepsen.rewind` (`RewindNet`, `RewindDB`,
                                     `clock-package`)
@@ -21,6 +23,7 @@ Build the two EROFS images once via:
 Then run:
     python3 examples/cluster/jepsen_nats.py --scenario healthy
     python3 examples/cluster/jepsen_nats.py --scenario crash-loss
+    python3 examples/cluster/jepsen_nats.py --scenario ab --replay
     python3 examples/cluster/jepsen_nats.py --scenario chaos
     python3 examples/cluster/jepsen_nats.py --scenario all --replay
 """
@@ -143,9 +146,11 @@ async def run_jepsen_scenario(
     nemesis: str,
     db_targets: str = "one,majority",
     time_limit: int = 16,
-    final_time_limit: int = 10,
+    final_time_limit: int = 12,
     rate: int = 20,
     nemesis_interval: int = 4,
+    sync_interval: str = "2m",
+    disk_mib: int = 64,
     expect_valid: bool,
     verify_replay: bool,
 ) -> dict:
@@ -197,8 +202,14 @@ async def run_jepsen_scenario(
                 role="service",
                 zone=f"az-{i}",
                 mem_mib=256,
+                env=[
+                    "NATS_STORE_DIR=/data/nats-data",
+                    f"NATS_SYNC_INTERVAL={sync_interval}",
+                ],
                 root=nats_erofs,
                 files={"/build/run_nats.sh": run_nats_sh},
+                disk_mib=disk_mib,
+                disk_mount="/data",
             )
         control = c.add_node(
             "control",
@@ -243,6 +254,9 @@ async def run_jepsen_scenario(
                 jepsen_summary = sig.json()
                 break
 
+        disk_stats = {
+            f"n{i}": await c.disk_stats(f"n{i}") for i in range(1, 4)
+        }
         await control.wait_exit(timeout_ms=15_000)
         run = await c.finish(verdict="passed")
 
@@ -261,24 +275,28 @@ async def run_jepsen_scenario(
         assert jepsen_summary["workload_valid"] is expect_valid, jepsen_summary
 
         lost_info = jepsen_summary["lost"]
+        flushes = "/".join(str(disk_stats[f"n{i}"]["flushes"]) for i in range(1, 4))
         print(
-            f"[jepsen:{label}] valid={jepsen_summary['workload_valid']} "
+            f"[jepsen:{label}] sync={sync_interval} valid={jepsen_summary['workload_valid']} "
             f"acked={jepsen_summary['acknowledged_count']} "
             f"read={jepsen_summary['read_count']} "
             f"lost={lost_info.get('lost-count', 0)} "
             f"(prefix={lost_info.get('lost-prefix-count', 0)}, "
             f"middle={lost_info.get('lost-middle-count', 0)}, "
             f"postfix={lost_info.get('lost-postfix-count', 0)}) "
-            f"faults={len(faults_applied)} wall={run['outcome']['wall_ms']}ms "
+            f"flushes={flushes} faults={len(faults_applied)} "
+            f"wall={run['outcome']['wall_ms']}ms "
             f"VT={run['outcome']['cluster_ns']/1e6:.1f}ms (cluster {run['id']})"
             + (" replay=IDENTICAL" if replay_ok else ""),
             flush=True,
         )
         return {
             "label": label,
+            "sync_interval": sync_interval,
             "cluster_id": run["id"],
             "faults_applied": faults_applied,
             "jepsen": jepsen_summary,
+            "disk_stats": disk_stats,
             "wall_ms": run["outcome"]["wall_ms"],
             "virtual_ms": round(run["outcome"]["cluster_ns"] / 1e6, 1),
             "replay": replay_ok,
@@ -291,9 +309,14 @@ async def main() -> None:
     )
     parser.add_argument(
         "--scenario",
-        choices=["healthy", "crash-loss", "chaos", "all"],
-        default="crash-loss",
-        help="Scenario to run (default: crash-loss).",
+        choices=["healthy", "crash-loss", "ab", "chaos", "all"],
+        default="ab",
+        help="Scenario to run (default: ab — compares sync_interval=2m vs always).",
+    )
+    parser.add_argument(
+        "--sync-interval",
+        default="2m",
+        help="JetStream sync_interval for non-ab scenarios (default: 2m).",
     )
     parser.add_argument(
         "--replay",
@@ -312,20 +335,36 @@ async def main() -> None:
             nemesis="none",
             time_limit=10,
             final_time_limit=8,
+            sync_interval=args.sync_interval,
             expect_valid=True,
             verify_replay=args.replay,
         )
-    if args.scenario in ("crash-loss", "all"):
-        summary["crash-loss"] = await run_jepsen_scenario(
+    if args.scenario in ("crash-loss", "ab", "all"):
+        summary["crash-loss-2m"] = await run_jepsen_scenario(
             nats_erofs,
             jepsen_erofs,
-            label="crash-loss",
+            label="sync-2m",
             nemesis="kill",
             db_targets="all",
             time_limit=16,
-            final_time_limit=10,
+            final_time_limit=12,
             nemesis_interval=4,
-            expect_valid=False,
+            sync_interval="2m" if args.scenario != "crash-loss" else args.sync_interval,
+            expect_valid=(args.scenario == "crash-loss" and args.sync_interval == "always"),
+            verify_replay=args.replay,
+        )
+    if args.scenario in ("ab", "all"):
+        summary["crash-safe-always"] = await run_jepsen_scenario(
+            nats_erofs,
+            jepsen_erofs,
+            label="sync-always",
+            nemesis="kill",
+            db_targets="all",
+            time_limit=16,
+            final_time_limit=12,
+            nemesis_interval=4,
+            sync_interval="always",
+            expect_valid=True,
             verify_replay=args.replay,
         )
     if args.scenario in ("chaos", "all"):
@@ -336,8 +375,9 @@ async def main() -> None:
             nemesis="partition,pause,clock,kill",
             db_targets="one,majority,all",
             time_limit=22,
-            final_time_limit=10,
+            final_time_limit=12,
             nemesis_interval=3,
+            sync_interval=args.sync_interval,
             expect_valid=False,
             verify_replay=args.replay,
         )

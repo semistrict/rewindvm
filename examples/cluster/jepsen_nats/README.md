@@ -39,11 +39,13 @@ and `REWIND_JEPSEN_NATS_EROFS`).
 ## 2. Run the Scenarios
 
 ```bash
+# Default A/B proof on persistent crash-consistent ext4 (/dev/rwd0 -> /data):
+#   - sync_interval: "2m"     -> :valid? false (acknowledged writes lost on power loss)
+#   - sync_interval: "always" -> :valid? true  (0 lost; ~3x REQ_OP_FLUSH / REQ_FUA barriers)
+python3 examples/cluster/jepsen_nats.py --scenario ab --replay
+
 # Healthy baseline (no faults): Jepsen queue checker passes (:valid? true, 0 lost)
 python3 examples/cluster/jepsen_nats.py --scenario healthy
-
-# Reproduce Jepsen's Dec 2025 NATS 2.12.1 crash data-loss finding (:valid? false)
-python3 examples/cluster/jepsen_nats.py --scenario crash-loss
 
 # Full Jepsen nemesis (partition + pause + clock + kill) driven by jepsen.rewind
 python3 examples/cluster/jepsen_nats.py --scenario chaos
@@ -52,10 +54,14 @@ python3 examples/cluster/jepsen_nats.py --scenario chaos
 python3 examples/cluster/jepsen_nats.py --scenario all --replay
 ```
 
-> **Storage note:** Rewind VMs currently mount `/tmp/nats-data` on ephemeral `tmpfs`, so
-> `c.crash()` + `c.restart()` on a node models sudden power loss before `fsync` (matching
-> NATS 2.12.1's default `sync_interval: 2m` lazy-fsync window where acknowledged JetStream
-> writes are not yet synced to durable storage). When a surviving replica stays up across
-> single/minority crashes, NATS replicates state back to restarted nodes; when all replicas
-> lose unsynced state (`crash-loss` / `chaos`), Jepsen catches total loss of all
-> acknowledged messages (`:valid? false`).
+## 3. Inspect in `rewind-app` (Cluster View)
+
+```bash
+rewind open <cluster-id>
+```
+
+Each NATS node (`n1`, `n2`, `n3`) is backed by a deterministic 64 MiB paravirtual
+`rewind-blk` (`/dev/rwd0`) disk formatted as `ext4` and mounted at `/data`.
+`c.crash()` models sudden power loss by discarding uncommitted sectors in the
+volatile write cache while preserving `fsync`ed (`REQ_OP_FLUSH` / `REQ_FUA`)
+blocks across `c.restart()` and ext4 journal replay.
