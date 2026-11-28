@@ -244,9 +244,26 @@ fn unpack_sched(sched: u64) -> (bool, Option<u32>) {
     (runnable, syscall)
 }
 
+/// The header flag on a [`BATCH_KIND`] record indicating that a rebooted
+/// cluster node started a fresh [`Encoder`] dictionary at the `step_base`
+/// stored in header bytes `8..16`.
+const FLAG_RESET: u16 = 1 << 0;
+
 /// Whether a trace record is a batch of encoded switches.
 pub fn is_batch(record: &[u8]) -> bool {
     record.len() >= HEADER_LEN && u16::from_le_bytes([record[4], record[5]]) == BATCH_KIND
+}
+
+/// Marks a [`BATCH_KIND`] record as the first batch of a new boot starting at
+/// `step_base`, instructing [`Decoder`] to reset its task dictionary and
+/// offset decoded steps by `step_base`.
+pub fn mark_reset(record: &mut [u8], step_base: u64) {
+    if !is_batch(record) {
+        return;
+    }
+    let flags = u16::from_le_bytes([record[6], record[7]]) | FLAG_RESET;
+    record[6..8].copy_from_slice(&flags.to_le_bytes());
+    record[8..16].copy_from_slice(&step_base.to_le_bytes());
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -616,6 +633,7 @@ pub struct Decoder {
     tasks: Vec<Task<'static>>,
     last_step: u64,
     last_ns: u64,
+    step_base: u64,
 }
 
 impl Decoder {
@@ -644,7 +662,7 @@ impl Decoder {
         out: &mut Vec<Switch>,
         wakes: &mut Vec<Wake>,
     ) -> Result<(), SwitchError> {
-        self.read_entries(step, record, Until::Whole, |e| match e {
+        self.read_entries(step, record, Until::Whole, |base, e| match e {
             Entry::Switch {
                 step,
                 ns,
@@ -653,7 +671,7 @@ impl Decoder {
             } => {
                 let (prev_runnable, prev_syscall) = unpack_sched(*sched);
                 out.push(Switch {
-                    step: *step,
+                    step: base.saturating_add(*step),
                     pid: task.pid,
                     tid: task.tid,
                     memory: task.memory,
@@ -663,7 +681,11 @@ impl Decoder {
                     prev_syscall,
                 });
             }
-            Entry::Wake(w) => wakes.push(*w),
+            Entry::Wake(w) => {
+                let mut wake = *w;
+                wake.step = base.saturating_add(wake.step);
+                wakes.push(wake);
+            }
         })?;
         Ok(())
     }
@@ -678,7 +700,7 @@ impl Decoder {
         until: Until,
         mut visit: impl FnMut(u64),
     ) -> Result<&'a [u8], SwitchError> {
-        self.read_entries(step, record, until, |e| visit(e.step()))
+        self.read_entries(step, record, until, |_, e| visit(e.step()))
     }
 
     fn read_entries<'a>(
@@ -686,7 +708,7 @@ impl Decoder {
         step: u64,
         record: &'a [u8],
         until: Until,
-        mut visit: impl FnMut(&Entry<'_>),
+        mut visit: impl FnMut(u64, &Entry<'_>),
     ) -> Result<&'a [u8], SwitchError> {
         if record.len() < HEADER_LEN {
             return Err(SwitchError::Truncated { step });
@@ -695,6 +717,14 @@ impl Decoder {
         if format != FORMAT {
             return Err(SwitchError::Format { step, format });
         }
+        let flags = u16::from_le_bytes([record[6], record[7]]);
+        if flags & FLAG_RESET != 0 {
+            self.tasks.clear();
+            self.last_step = 0;
+            self.last_ns = 0;
+            self.step_base = u64::from_le_bytes(record[8..16].try_into().expect("eight bytes"));
+        }
+        let base = self.step_base;
         let payload = &record[HEADER_LEN..];
         let mut r = Reader {
             bytes: payload,
@@ -716,13 +746,16 @@ impl Decoder {
                 let waker = r.u32("waker")?;
                 self.last_step = at;
                 self.last_ns = ns;
-                visit(&Entry::Wake(Wake {
-                    step: at,
-                    ns,
-                    tid,
-                    waker,
-                    how,
-                }));
+                visit(
+                    base,
+                    &Entry::Wake(Wake {
+                        step: at,
+                        ns,
+                        tid,
+                        waker,
+                        how,
+                    }),
+                );
                 consumed = payload.len() - r.bytes.len();
                 continue;
             }
@@ -740,12 +773,15 @@ impl Decoder {
             };
             self.last_step = at;
             self.last_ns = ns;
-            visit(&Entry::Switch {
-                step: at,
-                ns,
-                sched,
-                task: &self.tasks[task],
-            });
+            visit(
+                base,
+                &Entry::Switch {
+                    step: at,
+                    ns,
+                    sched,
+                    task: &self.tasks[task],
+                },
+            );
             consumed = payload.len() - r.bytes.len();
         }
         Ok(&payload[..consumed])
@@ -1318,5 +1354,31 @@ pub(crate) mod tests {
             Decoder::default().decode(9, &cut, &mut out, &mut Vec::new()),
             Err(SwitchError::Truncated { step: 9 })
         );
+    }
+
+    #[test]
+    fn multi_boot_reset_flag_decodes_fresh_encoder_with_step_base() {
+        let boot1 = run(&mut Encoder::new(), SWITCHES, 0, 9000);
+        let mut boot2 = run(&mut Encoder::new(), SWITCHES, 0, 9000);
+        const STEP_BASE: u64 = 10_000;
+        mark_reset(&mut boot2[0].1, STEP_BASE);
+
+        let mut decoder = Decoder::default();
+        let mut switches = Vec::new();
+        let mut wakes = Vec::new();
+        for (step, rec) in &boot1 {
+            decoder.decode(*step, rec, &mut switches, &mut wakes).unwrap();
+        }
+        let boot1_count = switches.len();
+        for (step, rec) in &boot2 {
+            decoder
+                .decode(STEP_BASE + *step, rec, &mut switches, &mut wakes)
+                .unwrap();
+        }
+        assert_eq!(switches.len(), boot1_count * 2);
+        for i in 0..boot1_count {
+            assert_eq!(switches[boot1_count + i].step, STEP_BASE + switches[i].step);
+            assert_eq!(switches[boot1_count + i].name, switches[i].name);
+        }
     }
 }

@@ -152,9 +152,24 @@ pub enum IoError {
     OutOfRange { step: u64, what: &'static str },
 }
 
+/// The header flag on a [`KIND`] record indicating that a rebooted cluster
+/// node started a fresh [`Encoder`] dictionary.
+const FLAG_RESET: u16 = 1 << 0;
+
 /// Whether a trace record holds read and write records.
 pub fn is_io(record: &[u8]) -> bool {
     record.len() >= HEADER_LEN && u16::from_le_bytes([record[4], record[5]]) == KIND
+}
+
+/// Marks a [`KIND`] record as the first I/O record of a new boot, instructing
+/// [`decode`] to reset the per-boot wire dictionary while keeping earlier
+/// boots' [`FileId`] and [`PathId`] values valid.
+pub fn mark_reset(record: &mut [u8]) {
+    if !is_io(record) {
+        return;
+    }
+    let flags = u16::from_le_bytes([record[6], record[7]]) | FLAG_RESET;
+    record[6..8].copy_from_slice(&flags.to_le_bytes());
 }
 
 /// The read and write records among a trace file's records, as
@@ -352,6 +367,10 @@ struct Tables {
     names: Vec<String>,
     last_path: Vec<u8>,
     tid: u32,
+    #[serde(default)]
+    file_base: usize,
+    #[serde(default)]
+    path_base: usize,
 }
 
 impl Tables {
@@ -452,6 +471,13 @@ impl Tables {
         if format != FORMAT {
             return Err(IoError::Format { step, format });
         }
+        let flags = u16::from_le_bytes([record[6], record[7]]);
+        if flags & FLAG_RESET != 0 {
+            self.file_base = self.ends.len();
+            self.path_base = self.names.len();
+            self.last_path.clear();
+            self.tid = 0;
+        }
         let mut r = Reader {
             bytes: &record[HEADER_LEN..],
             step,
@@ -519,9 +545,9 @@ impl Tables {
     /// Decodes a reference to a file, and its definition if it is new.
     fn get_file(&mut self, r: &mut Reader) -> Result<FileId, IoError> {
         let id = r.varint()?;
-        let defined = self.ends.len() as u64;
+        let defined = (self.ends.len() - self.file_base) as u64;
         if id < defined {
-            return Ok(id as FileId);
+            return Ok((self.file_base + id as usize) as FileId);
         }
         if id > defined {
             return Err(IoError::Undefined {
@@ -538,9 +564,9 @@ impl Tables {
     /// Decodes a reference to a path, and its definition if it is new.
     fn get_path(&mut self, r: &mut Reader) -> Result<PathId, IoError> {
         let id = r.varint()?;
-        let defined = self.names.len() as u64;
+        let defined = (self.names.len() - self.path_base) as u64;
         if id < defined {
-            return Ok(id as PathId);
+            return Ok((self.path_base + id as usize) as PathId);
         }
         if id > defined {
             return Err(IoError::Undefined {
@@ -970,5 +996,28 @@ mod tests {
                 what: "count"
             }
         );
+    }
+
+    #[test]
+    fn multi_boot_reset_flag_preserves_prior_boot_paths_and_files() {
+        let mut p1 = Vec::new();
+        read_open_entry(&mut p1, 1);
+        let r1 = record(&p1);
+
+        let mut p2 = Vec::new();
+        p2.push(kind::READ_OPEN);
+        put(&mut p2, zigzag(2));
+        put(&mut p2, 0); // path 0 in boot 2
+        put(&mut p2, 0);
+        put(&mut p2, 1);
+        p2.push(b'b');
+        let mut r2 = record(&p2);
+        mark_reset(&mut r2);
+
+        let log = decode(&[(10, r1), (100, r2)]).unwrap();
+        assert_eq!(log.records.len(), 2);
+        assert_eq!(log.paths, vec!["a", "b"]);
+        assert_eq!(log.records[0].io, Io::ReadOpen { tid: 1, path: 0 });
+        assert_eq!(log.records[1].io, Io::ReadOpen { tid: 2, path: 1 });
     }
 }

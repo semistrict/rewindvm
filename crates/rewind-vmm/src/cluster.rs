@@ -229,6 +229,10 @@ pub struct ClusterNodeKeyframe {
     pub paused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_drift_ppm: Option<i32>,
+    #[serde(default)]
+    pub reset_switches_next: bool,
+    #[serde(default)]
+    pub reset_io_next: bool,
     pub pending_rx: Vec<InFlightFrame>,
 }
 
@@ -417,6 +421,20 @@ fn extract_node_chain(chain: &[ClusterKeyframe], idx: usize, boot_count: u32) ->
         }
     }
     node_chain
+}
+
+/// Extracts only the current boot's records from a multi-boot per-node trace,
+/// rebasing outer record steps back to boot-local steps (`0..`) for
+/// [`Machine::restore`] and `Encoder::resume`.
+fn boot_local_trace(trace: &[(u64, Vec<u8>)], step_base: u64) -> Vec<(u64, Vec<u8>)> {
+    if step_base == 0 {
+        return trace.to_vec();
+    }
+    let start = trace.partition_point(|(s, _)| *s < step_base);
+    trace[start..]
+        .iter()
+        .map(|(s, rec)| (s - step_base, rec.clone()))
+        .collect()
 }
 
 fn build_page_source(chain: &[Keyframe], pages: &(dyn Pages + Sync)) -> Result<PageSource> {
@@ -1530,6 +1548,11 @@ struct LiveNode {
     exited: bool,
     /// Whether this node's vCPU is frozen via `FaultKind::Pause`.
     paused: bool,
+    /// Whether the next emitted `switches` batch / `io_records` record for this
+    /// node must carry `FLAG_RESET` (set after a reboot so multi-boot traces
+    /// reset their dictionary cleanly).
+    reset_switches_next: bool,
+    reset_io_next: bool,
     last_stop: Option<Stop>,
     /// Frames that arrived while the guest RX ring was full, before setup, or while paused.
     pending_rx: VecDeque<InFlightFrame>,
@@ -1807,7 +1830,7 @@ impl LiveNode {
                 }
             }
         };
-        self.step_base += steps;
+        self.step_base = self.step_base.saturating_add(steps).saturating_add(1);
         self.meta = None;
         self.paused = false;
         self.pending_rx.clear();
@@ -1861,6 +1884,8 @@ impl LiveNode {
         self.clock_drift_ppm = self.cfg.clock_drift_ppm;
         self.exited = false;
         self.paused = false;
+        self.reset_switches_next = self.boot_count > 1;
+        self.reset_io_next = self.boot_count > 1;
         self.last_stop = None;
         self.pending_rx.clear();
         Ok(())
@@ -2115,6 +2140,8 @@ impl Cluster {
                     step_base: 0,
                     exited: false,
                     paused: false,
+                    reset_switches_next: false,
+                    reset_io_next: false,
                     last_stop: None,
                     pending_rx: VecDeque::new(),
                 });
@@ -2141,6 +2168,8 @@ impl Cluster {
                     step_base: 0,
                     exited: false,
                     paused: false,
+                    reset_switches_next: false,
+                    reset_io_next: false,
                     last_stop: None,
                     pending_rx: VecDeque::new(),
                 });
@@ -2201,7 +2230,9 @@ impl Cluster {
                         m_cfg.seed = reboot_seed(node_cfg.base_seed, last_nk.boot_count);
                     }
                     let page_source = build_page_source(&node_chain, pages)?;
-                    let trace = node_traces.get(idx).cloned().unwrap_or_default();
+                    let trace = node_traces
+                        .get(idx)
+                        .map_or_else(Vec::new, |t| boot_local_trace(t, last_nk.step_base));
                     worker.send(WorkerReq::Restore {
                         config: Box::new(m_cfg),
                         chain: node_chain,
@@ -2250,6 +2281,8 @@ impl Cluster {
                     step_base: last_nk.step_base,
                     exited: last_nk.exited,
                     paused: last_nk.paused,
+                    reset_switches_next: last_nk.reset_switches_next,
+                    reset_io_next: last_nk.reset_io_next,
                     last_stop: None,
                     pending_rx: last_nk.pending_rx.iter().cloned().collect(),
                 });
@@ -2281,8 +2314,10 @@ impl Cluster {
             if last_nk.boot_count > 1 {
                 m_cfg.seed = reboot_seed(node_cfg.base_seed, last_nk.boot_count);
             }
-            let trace = node_traces.get(idx).map_or(&[][..], Vec::as_slice);
-            let mut m = Machine::restore(&m_cfg, &node_chain, pages, trace, dirty_log)
+            let trace = node_traces
+                .get(idx)
+                .map_or_else(Vec::new, |t| boot_local_trace(t, last_nk.step_base));
+            let mut m = Machine::restore(&m_cfg, &node_chain, pages, &trace, dirty_log)
                 .with_context(|| format!("restoring cluster node {}", node_cfg.name))?;
             m.set_cluster_mode(true);
             m.set_idle(last_nk.idle, last_nk.net_rx_pending);
@@ -2345,6 +2380,8 @@ impl Cluster {
                 step_base: last_nk.step_base,
                 exited: last_nk.exited,
                 paused: last_nk.paused,
+                reset_switches_next: last_nk.reset_switches_next,
+                reset_io_next: last_nk.reset_io_next,
                 last_stop: None,
                 pending_rx: last_nk.pending_rx.iter().cloned().collect(),
             });
@@ -2406,7 +2443,9 @@ impl Cluster {
                         m_cfg.seed = reboot_seed(node.cfg.base_seed, last_nk.boot_count);
                     }
                     let page_source = build_page_source(&node_chain, pages)?;
-                    let trace = node_traces.get(idx).cloned().unwrap_or_default();
+                    let trace = node_traces
+                        .get(idx)
+                        .map_or_else(Vec::new, |t| boot_local_trace(t, last_nk.step_base));
                     let can_reuse = self.dirty_log == DirtyLog::On
                         && node.meta.is_some()
                         && node.boot_count == last_nk.boot_count;
@@ -2452,7 +2491,9 @@ impl Cluster {
                 if last_nk.boot_count > 1 {
                     m_cfg.seed = reboot_seed(node.cfg.base_seed, last_nk.boot_count);
                 }
-                let trace = node_traces.get(idx).map_or(&[][..], Vec::as_slice);
+                let trace = node_traces
+                    .get(idx)
+                    .map_or_else(Vec::new, |t| boot_local_trace(t, last_nk.step_base));
                 let can_reuse = self.dirty_log == DirtyLog::On
                     && node.boot_count == last_nk.boot_count
                     && opt.as_ref().is_some_and(|m| m.can_restore_in_place());
@@ -2460,7 +2501,7 @@ impl Cluster {
                     let m = opt.as_mut().expect("checked live above");
                     let chain_refs: Vec<&Keyframe> = node_chain.iter().collect();
                     let rewritten = m
-                        .restore_in_place_count(&chain_refs, pages, trace)
+                        .restore_in_place_count(&chain_refs, pages, &trace)
                         .with_context(|| {
                             format!("restoring cluster node {} in place", node.cfg.name)
                         })?;
@@ -2471,7 +2512,7 @@ impl Cluster {
                     stats.pages_rewritten += rewritten;
                 } else {
                     *opt = None;
-                    let mut m = Machine::restore(&m_cfg, &node_chain, pages, trace, self.dirty_log)
+                    let mut m = Machine::restore(&m_cfg, &node_chain, pages, &trace, self.dirty_log)
                         .with_context(|| format!("restoring cluster node {}", node.cfg.name))?;
                     m.set_cluster_mode(true);
                     m.set_idle(last_nk.idle, last_nk.net_rx_pending);
@@ -2542,6 +2583,8 @@ impl Cluster {
             node.step_base = last_nk.step_base;
             node.exited = last_nk.exited;
             node.paused = last_nk.paused;
+            node.reset_switches_next = last_nk.reset_switches_next;
+            node.reset_io_next = last_nk.reset_io_next;
             node.last_stop = None;
             node.pending_rx = last_nk.pending_rx.iter().cloned().collect();
         }
@@ -2663,6 +2706,8 @@ impl Cluster {
                 exited: node.exited,
                 paused: node.paused,
                 clock_drift_ppm: Some(node.clock_drift_ppm),
+                reset_switches_next: node.reset_switches_next,
+                reset_io_next: node.reset_io_next,
                 pending_rx: node.pending_rx.iter().cloned().collect(),
             });
         }
@@ -2915,7 +2960,8 @@ impl Cluster {
         if live.boot_count > 1 {
             cfg.seed = reboot_seed(live.cfg.base_seed, live.boot_count);
         }
-        let mut cloned = Machine::restore(&cfg, &[kf], &mem_pages, node_trace, DirtyLog::Off)?;
+        let local_trace = boot_local_trace(node_trace, live.step_base);
+        let mut cloned = Machine::restore(&cfg, &[kf], &mem_pages, &local_trace, DirtyLog::Off)?;
         if let Some((io, switches)) = enc {
             cloned.set_encoders(io, switches);
         }
@@ -3310,8 +3356,18 @@ impl Cluster {
                 let prev_local = self.nodes[idx].local_now();
                 let prev_idle = self.nodes[idx].meta.as_ref().is_some_and(|m| m.is_idle);
 
-                for (step, rec) in &reply.events.records {
-                    obs.node_record(idx, *step, rec);
+                for (step, mut rec) in reply.events.records {
+                    if self.nodes[idx].reset_switches_next
+                        && rewind_trace::switches::is_batch(&rec)
+                    {
+                        rewind_trace::switches::mark_reset(&mut rec, self.nodes[idx].step_base);
+                        self.nodes[idx].reset_switches_next = false;
+                    } else if self.nodes[idx].reset_io_next && rewind_trace::io_records::is_io(&rec)
+                    {
+                        rewind_trace::io_records::mark_reset(&mut rec);
+                        self.nodes[idx].reset_io_next = false;
+                    }
+                    obs.node_record(idx, step, &rec);
                 }
                 for (step, byte) in &reply.events.serial {
                     obs.node_serial(idx, *step, *byte);
