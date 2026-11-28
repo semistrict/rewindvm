@@ -110,6 +110,8 @@ pub struct BootSpec<'a> {
     pub pmem_len: u64,
     /// The extras slot's length, or 0 for a machine without one.
     pub extras_len: u64,
+    /// Optional paravirtual framebuffer reserved at the top of low RAM.
+    pub fb: Option<crate::FramebufferConfig>,
 }
 
 /// A loadable segment of the kernel's ELF: `filesz` bytes of the file at
@@ -242,8 +244,19 @@ pub fn load(ram: &mut Mapping, spec: &BootSpec) -> Result<u64> {
     write_u16(&mut params, bp::XLOADFLAGS, XLF_KERNEL_64);
     params[bp::TYPE_OF_LOADER] = LOADER_UNDEFINED;
 
-    // The initramfs goes as high as the kernel allows, above the kernel.
-    let initrd_max = INITRD_ADDR_MAX.min(ram.len() as u64 - 1);
+    // Reserve top of low RAM for simpledrm framebuffer if display is enabled.
+    let low_raw = (ram.len() as u64).min(RAM_MAX);
+    let fb_reserved = match spec.fb {
+        Some(fb) => {
+            let (_info, fb_off, alloc_size) = crate::framebuffer_layout(0, low_raw, fb)?;
+            Some((fb_off, alloc_size))
+        }
+        None => None,
+    };
+    let low_usable = fb_reserved.map_or(low_raw, |(off, _)| off);
+
+    // The initramfs goes as high as the kernel allows, above the kernel and below any framebuffer.
+    let initrd_max = INITRD_ADDR_MAX.min(low_usable - 1);
     let initrd_len = spec.initrd.len() as u64;
     if initrd_len > 0 {
         // An initramfs longer than everything below initrd_max has no
@@ -291,11 +304,15 @@ pub fn load(ram: &mut Mapping, spec: &BootSpec) -> Result<u64> {
     // hole and from 4 GiB on past it, and the input image as persistent
     // memory after that (`pmem_start`).
     let [(_, low), (high_start, high)] = ram_parts(ram.len() as u64);
+    let low_ram_end = fb_reserved.map_or(low, |(off, _)| off);
     let mut e820 = vec![
         (0, EBDA_START, E820::Ram),
         (EBDA_START, RAM_START - EBDA_START, E820::Reserved),
-        (RAM_START, low - RAM_START, E820::Ram),
+        (RAM_START, low_ram_end - RAM_START, E820::Ram),
     ];
+    if let Some((fb_off, fb_len)) = fb_reserved {
+        e820.push((fb_off, fb_len, E820::Reserved));
+    }
     if high > 0 {
         e820.push((high_start, high, E820::Ram));
     }
@@ -415,6 +432,7 @@ mod tests {
             seed: [0; 32],
             pmem_len: 0,
             extras_len: 0,
+            fb: None,
         }
     }
 

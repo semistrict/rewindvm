@@ -242,6 +242,18 @@ struct rewind_shared {
 	u32 net_rx_cons;	/* guest advances as it drains RX frames */
 	u8 net_mac[6];
 	u8 net_pad[2];
+	/*
+	 * Paravirtual framebuffer (/dev/fb0) for deterministic screencasts.
+	 * The monitor sets fb_enabled = 1 (and optional fb_width/fb_height)
+	 * during setup; the guest allocates contiguous guest RAM for the
+	 * framebuffer and publishes fb_addr, fb_stride, and fb_size.
+	 */
+	u32 fb_enabled;
+	u64 fb_addr;		/* physical address of framebuffer RAM */
+	u32 fb_width;
+	u32 fb_height;
+	u32 fb_stride;
+	u32 fb_size;
 };
 
 #define REWIND_PENDING_TIMER	BIT(0)
@@ -843,6 +855,10 @@ void __init rewind_init_platform(void)
 	BUILD_BUG_ON(offsetof(struct rewind_shared, net_enabled) != 3292);
 	BUILD_BUG_ON(offsetof(struct rewind_shared, net_rx_ring) != 3296);
 	BUILD_BUG_ON(offsetof(struct rewind_shared, net_mac) != 3316);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_enabled) != 3324);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_addr) != 3328);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_width) != 3336);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_size) != 3348);
 	rewind_publish_tasks();
 	rewind_shared.interface = REWIND_INTERFACE;
 	rewind_shared.io_buf = __pa_symbol(rewind_io_buf);

@@ -1,0 +1,94 @@
+diff --git a/arch/x86/kernel/cpu/rewind.c b/arch/x86/kernel/cpu/rewind.c
+--- a/arch/x86/kernel/cpu/rewind.c
++++ b/arch/x86/kernel/cpu/rewind.c
+@@ -52,6 +52,8 @@
+ #include <linux/mutex.h>
+ #include <linux/namei.h>
+ #include <linux/netdevice.h>
++#include <linux/platform_data/simplefb.h>
++#include <linux/platform_device.h>
+ #include <linux/pm.h>
+ #include <linux/poll.h>
+ #include <linux/random.h>
+@@ -273,6 +275,18 @@
+ 	u32 net_rx_cons;	/* guest advances as it drains RX frames */
+ 	u8 net_mac[6];
+ 	u8 net_pad[2];
++	/*
++	 * Paravirtual DRM/KMS framebuffer (/dev/dri/card0 + /dev/fb0) via
++	 * mainline simpledrm. The monitor reserves a contiguous top-of-RAM
++	 * region and publishes fb_enabled, fb_addr, fb_width, fb_height,
++	 * fb_stride, and fb_size during setup.
++	 */
++	u32 fb_enabled;
++	u64 fb_addr;		/* physical address of reserved framebuffer RAM */
++	u32 fb_width;
++	u32 fb_height;
++	u32 fb_stride;
++	u32 fb_size;
+ };
+ 
+ /* Reasons for an interrupt, in rewind_shared.pending. */
+@@ -789,6 +803,38 @@
+ }
+ 
+ /*
++ * Registers the monitor-reserved framebuffer region as a standard
++ * "simple-framebuffer" platform device so mainline Linux simpledrm exposes
++ * both /dev/dri/card0 (Wayland KMS) and /dev/fb0 (fbdev emulation).
++ */
++static int __init rewind_fb_init(void)
++{
++	u64 addr = READ_ONCE(rewind_shared.fb_addr);
++	u32 width = READ_ONCE(rewind_shared.fb_width);
++	u32 height = READ_ONCE(rewind_shared.fb_height);
++	u32 stride = READ_ONCE(rewind_shared.fb_stride);
++	u32 size = READ_ONCE(rewind_shared.fb_size);
++	struct resource res = {
++		.flags = IORESOURCE_MEM,
++		.start = addr,
++		.end = addr + PAGE_ALIGN(size) - 1,
++	};
++	struct simplefb_platform_data pdata = {
++		.width = width,
++		.height = height,
++		.stride = stride,
++		.format = "x8r8g8b8",
++	};
++	struct platform_device *pdev;
++
++	if (!addr || !width || !height || !stride || !size)
++		return 0;
++	pdev = platform_device_register_resndata(NULL, "simple-framebuffer", 0,
++						 &res, 1, &pdata, sizeof(pdata));
++	return PTR_ERR_OR_ZERO(pdev);
++}
++
++/*
+  * The monitor's one interrupt. A timer that is due runs the clock event
+  * handler. A preemption request marks the current task for rescheduling,
+  * so the scheduler picks again on the way back to user space: this is how
+@@ -1039,6 +1085,10 @@
+ 	BUILD_BUG_ON(offsetof(struct rewind_shared, net_enabled) != 3292);
+ 	BUILD_BUG_ON(offsetof(struct rewind_shared, net_rx_ring) != 3296);
+ 	BUILD_BUG_ON(offsetof(struct rewind_shared, net_mac) != 3316);
++	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_enabled) != 3324);
++	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_addr) != 3328);
++	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_width) != 3336);
++	BUILD_BUG_ON(offsetof(struct rewind_shared, fb_size) != 3348);
+ 	rewind_publish_tasks();
+ 	rewind_shared.interface = REWIND_INTERFACE;
+ 	rewind_shared.io_buf = __pa_symbol(rewind_io_buf);
+@@ -2002,6 +2052,12 @@
+ 		if (err)
+ 			return err;
+ 	}
++
++	if (READ_ONCE(rewind_shared.fb_enabled)) {
++		err = rewind_fb_init();
++		if (err)
++			return err;
++	}
+ 
+ 	WARN_ON(register_trace_sched_process_exec(rewind_probe_exec, NULL));
+ 	WARN_ON(register_trace_sched_process_fork(rewind_probe_fork, NULL));

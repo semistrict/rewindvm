@@ -21,6 +21,13 @@ CONFIG_KALLSYMS=y
 CONFIG_TTY=y
 CONFIG_UNIX98_PTYS=y
 
+# Paravirtual DRM/KMS framebuffer (/dev/dri/card0 + /dev/fb0) via mainline simpledrm.
+CONFIG_DRM=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FB_DEVICE=y
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+
 # Tracing infrastructure required by Rewind's sched/signal/syscall tracepoints.
 CONFIG_FTRACE=y
 CONFIG_ENABLE_DEFAULT_TRACERS=y

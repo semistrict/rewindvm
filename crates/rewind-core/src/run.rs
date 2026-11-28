@@ -135,6 +135,7 @@ impl SpecExt for Spec {
             preemption: self.preemption,
             extras: self.extras,
             net: None,
+            fb: None,
         })
     }
 }

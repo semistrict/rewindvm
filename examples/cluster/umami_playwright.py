@@ -78,6 +78,7 @@ def main() -> None:
     pg_erofs = os.environ.get("REWIND_POSTGRES_EROFS")
     umami_erofs = os.environ.get("REWIND_UMAMI_EROFS")
     pw_erofs = os.environ.get("REWIND_PLAYWRIGHT_EROFS")
+    display = os.environ.get("REWIND_DISPLAY", "1") not in ("0", "false", "no", "off")
 
     t0 = time.perf_counter()
     with Cluster(
@@ -122,16 +123,20 @@ def main() -> None:
             **app_kwargs,
         )
 
-        pw_kwargs = (
-            {"root": pw_erofs}
-            if pw_erofs
-            else {
-                "packages": [
-                    "nixpkgs#python3Packages.playwright",
-                    "nixpkgs#playwright-driver.browsers-chromium",
+        pw_pkgs = [
+            "nixpkgs#python3Packages.playwright",
+            "nixpkgs#playwright-driver.browsers-chromium",
+        ]
+        if display:
+            pw_pkgs.extend(
+                [
+                    "nixpkgs#labwc",
+                    "nixpkgs#seatd",
+                    "nixpkgs#dejavu_fonts",
+                    "nixpkgs#fontconfig",
                 ]
-            }
-        )
+            )
+        pw_kwargs = {"root": pw_erofs} if pw_erofs else {"packages": pw_pkgs}
         pw_env = [
             "UMAMI_URL=http://10.0.0.2:3000",
             "HOME=/tmp",
@@ -146,6 +151,9 @@ def main() -> None:
             ip="10.0.0.3",
             role="driver",
             mem_mib=1536,
+            display=display,
+            display_width=1280 if display else None,
+            display_height=720 if display else None,
             env=pw_env,
             files={"/build/runner.py": RUNNER_SCRIPT},
             **pw_kwargs,

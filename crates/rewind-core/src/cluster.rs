@@ -31,7 +31,9 @@ use rewind_vmm::net::{
     DEFAULT_LATENCY_NS, FaultKind, LinkOverride, NemesisConfig, NetEvent, NetLogReader,
     NetLogWriter, NetSwitchConfig, ScheduledFault, mac_for_node,
 };
-use rewind_vmm::{ClockSource, CpuModel, DirtyLog, Machine, NetDeviceConfig, Preemption};
+use rewind_vmm::{
+    ClockSource, CpuModel, DirtyLog, FramebufferConfig, Machine, NetDeviceConfig, Preemption,
+};
 
 use crate::home::{Guest, Home};
 use crate::keyframes::{ReadPages, StorePages};
@@ -651,6 +653,14 @@ pub fn prepare_cluster(
         };
         let mut cfg = spec.config()?;
         cfg.net = Some(NetDeviceConfig { mac });
+        cfg.fb = if n.display {
+            Some(FramebufferConfig {
+                width: n.display_width.unwrap_or(rewind_vmm::pv::FB_DEFAULT_WIDTH),
+                height: n.display_height.unwrap_or(rewind_vmm::pv::FB_DEFAULT_HEIGHT),
+            })
+        } else {
+            None
+        };
 
         let skew_ns = n.clock_skew_ms.saturating_mul(1_000_000);
         node_manifests.push(ClusterNodeManifest {
@@ -660,6 +670,9 @@ pub fn prepare_cluster(
             role: role_str(roles[idx]).to_string(),
             clock_skew_ns: skew_ns,
             clock_drift_ppm: n.clock_drift_ppm,
+            display: n.display,
+            display_width: n.display_width,
+            display_height: n.display_height,
             spec,
         });
         node_configs.push(ClusterNodeConfig {
@@ -737,6 +750,19 @@ pub(crate) fn compute_cluster_id(
         hasher.update(n.role.as_bytes());
         hasher.update(&n.clock_skew_ns.to_le_bytes());
         hasher.update(&n.clock_drift_ppm.to_le_bytes());
+        if n.display {
+            hasher.update(b"fb");
+            hasher.update(
+                &n.display_width
+                    .unwrap_or(rewind_vmm::pv::FB_DEFAULT_WIDTH)
+                    .to_le_bytes(),
+            );
+            hasher.update(
+                &n.display_height
+                    .unwrap_or(rewind_vmm::pv::FB_DEFAULT_HEIGHT)
+                    .to_le_bytes(),
+            );
+        }
         hasher.update(n.spec.id().as_bytes());
     }
     hasher.update(network_json.to_string().as_bytes());
@@ -758,6 +784,14 @@ pub fn config_from_manifest(manifest: &ClusterManifest) -> Result<ClusterConfig>
     for n in &manifest.nodes {
         let mut cfg = n.spec.config()?;
         cfg.net = Some(NetDeviceConfig { mac: n.mac });
+        cfg.fb = if n.display {
+            Some(FramebufferConfig {
+                width: n.display_width.unwrap_or(rewind_vmm::pv::FB_DEFAULT_WIDTH),
+                height: n.display_height.unwrap_or(rewind_vmm::pv::FB_DEFAULT_HEIGHT),
+            })
+        } else {
+            None
+        };
         nodes.push(ClusterNodeConfig {
             name: n.name.clone(),
             config: cfg,
@@ -966,6 +1000,41 @@ impl ClusterRun {
         Ok(events)
     }
 
+    /// Restores a cluster at the latest recorded keyframe at or before `from_ns`
+    /// (or boots from virtual time 0 when `from_ns == 0` or no earlier keyframe
+    /// exists).
+    fn open_cluster_at(&self, home: &Home, from_ns: u64) -> Result<Cluster> {
+        let cfg = config_from_manifest(&self.manifest)?;
+        if from_ns > 0 {
+            let keyframes = load_cluster_keyframes(&self.dir)?;
+            let best_idx = keyframes.iter().rposition(|ckf| ckf.cluster_ns <= from_ns);
+            if let Some(idx) = best_idx {
+                let store = Store::open(&home.store())?;
+                let pages = ReadPages(&store);
+                let mut node_traces = Vec::with_capacity(self.manifest.nodes.len());
+                for n in &self.manifest.nodes {
+                    let tp = self
+                        .dir
+                        .join(CLUSTER_NODES_DIR)
+                        .join(&n.name)
+                        .join(rewind_trace::manifest::TRACE);
+                    node_traces.push(
+                        rewind_trace::Records::new(BufReader::new(File::open(&tp)?))?
+                            .collect::<std::io::Result<Vec<_>>>()?,
+                    );
+                }
+                return Cluster::restore(
+                    cfg,
+                    &keyframes[..=idx],
+                    &pages,
+                    &node_traces,
+                    DirtyLog::Off,
+                );
+            }
+        }
+        Cluster::boot(cfg, DirtyLog::Off)
+    }
+
     /// Replays this cluster run (from the nearest keyframe at or before
     /// `from_ms`, or from boot) and writes every raw transmitted Ethernet
     /// frame in `[from_ms, to_ms]` as a standard nanosecond-resolution `.pcap`
@@ -995,40 +1064,13 @@ impl ClusterRun {
             None => None,
         };
 
-        let cfg = config_from_manifest(&self.manifest)?;
         let epoch_secs = self
             .manifest
             .nodes
             .first()
             .map_or(0, |n| n.spec.epoch);
 
-        // When a start time is given, fast-forward by restoring from the latest
-        // cluster keyframe at or before `from_ns`.
-        let mut cluster = if from_ns > 0 {
-            let keyframes = load_cluster_keyframes(&self.dir)?;
-            let best_idx = keyframes.iter().rposition(|ckf| ckf.cluster_ns <= from_ns);
-            if let Some(idx) = best_idx {
-                let store = Store::open(&home.store())?;
-                let pages = ReadPages(&store);
-                let mut node_traces = Vec::with_capacity(self.manifest.nodes.len());
-                for n in &self.manifest.nodes {
-                    let tp = self
-                        .dir
-                        .join(CLUSTER_NODES_DIR)
-                        .join(&n.name)
-                        .join(rewind_trace::manifest::TRACE);
-                    node_traces.push(
-                        rewind_trace::Records::new(BufReader::new(File::open(&tp)?))?
-                            .collect::<std::io::Result<Vec<_>>>()?,
-                    );
-                }
-                Cluster::restore(cfg, &keyframes[..=idx], &pages, &node_traces, DirtyLog::Off)?
-            } else {
-                Cluster::boot(cfg, DirtyLog::Off)?
-            }
-        } else {
-            Cluster::boot(cfg, DirtyLog::Off)?
-        };
+        let mut cluster = self.open_cluster_at(home, from_ns)?;
 
         write_pcap_header(out)?;
         let mut observer = PcapObserver {
@@ -1051,6 +1093,180 @@ impl ClusterRun {
             bytes: observer.bytes,
             from_ns,
             to_ns: to_ns.unwrap_or_else(|| cluster.cluster_ns()),
+        })
+    }
+
+    /// Replays this cluster run (fast-forwarding from the nearest keyframe at
+    /// or before `from_ms`) and samples `node_name`'s paravirtual framebuffer
+    /// (`/dev/fb0`) at `opts.fps` virtual frames per second, writing a
+    /// deterministic screencast (`.mp4`, `.webm`, `.gif`, `.png`, or `.raw`)
+    /// synced to the exact same virtual-time axis as `rewind cluster pcap`.
+    pub fn export_video(
+        &self,
+        home: &Home,
+        node_name: &str,
+        out_path: &Path,
+        opts: &VideoExportOptions,
+    ) -> Result<VideoExportStats> {
+        if opts.fps == 0 || opts.fps > 120 {
+            bail!("fps must be between 1 and 120 (got {})", opts.fps);
+        }
+        let node_idx = self
+            .manifest
+            .nodes
+            .iter()
+            .position(|n| n.name == node_name)
+            .with_context(|| {
+                let names: Vec<&str> = self
+                    .manifest
+                    .nodes
+                    .iter()
+                    .map(|n| n.name.as_str())
+                    .collect();
+                format!(
+                    "cluster {} has no node {node_name:?} (nodes: {})",
+                    self.manifest.id,
+                    names.join(", ")
+                )
+            })?;
+        let node = &self.manifest.nodes[node_idx];
+        if !node.display {
+            bail!(
+                "node {node_name:?} in cluster {} was recorded without display=true (no /dev/fb0)",
+                self.manifest.id
+            );
+        }
+
+        let width = node
+            .display_width
+            .unwrap_or(rewind_vmm::pv::FB_DEFAULT_WIDTH);
+        let height = node
+            .display_height
+            .unwrap_or(rewind_vmm::pv::FB_DEFAULT_HEIGHT);
+        let from_ns = opts.from_ms.map_or(0, |ms| ms.saturating_mul(1_000_000));
+        let end_ns = opts
+            .to_ms
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .or_else(|| self.manifest.outcome.as_ref().map(|o| o.cluster_ns));
+
+        let mut cluster = self.open_cluster_at(home, from_ns)?;
+        let mut noop = NoopObserver;
+
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let ext = out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_ascii_lowercase();
+        let single_png = ext == "png";
+        let raw_mode = ext == "raw" || ext == "bgr0";
+
+        let mut raw_file: Option<std::io::BufWriter<File>> = None;
+        let mut ffmpeg: Option<FfmpegPipe> = None;
+
+        let mut sink_w = width;
+        let mut sink_h = height;
+        let mut frames = 0u64;
+        let mut non_blank_frames = 0u64;
+        let mut last_ns = from_ns;
+        let mut scratch = Vec::new();
+
+        loop {
+            let target_ns = if single_png {
+                from_ns
+            } else {
+                from_ns
+                    .saturating_add(frames.saturating_mul(1_000_000_000) / u64::from(opts.fps))
+            };
+            if !single_png
+                && let Some(end) = end_ns
+                && target_ns > end
+            {
+                break;
+            }
+
+            let outcome = if target_ns > cluster.cluster_ns() || frames == 0 {
+                Some(cluster.run(&mut noop, Some(target_ns), None)?)
+            } else {
+                None
+            };
+            last_ns = cluster.cluster_ns();
+
+            let fb = cluster.read_node_framebuffer(node_idx)?;
+            let (fw, fh) = match &fb {
+                Some((info, pixels)) => {
+                    pack_bgr0_frame(info.width, info.height, info.stride, pixels, &mut scratch);
+                    if scratch.iter().any(|&b| b != 0) {
+                        non_blank_frames += 1;
+                    }
+                    (info.width, info.height)
+                }
+                None => {
+                    let needed = (sink_w as usize) * (sink_h as usize) * 4;
+                    scratch.resize(needed, 0);
+                    scratch.fill(0);
+                    (sink_w, sink_h)
+                }
+            };
+
+            if frames == 0 {
+                sink_w = fw;
+                sink_h = fh;
+                if raw_mode {
+                    let f = File::create(out_path)
+                        .with_context(|| format!("creating {}", out_path.display()))?;
+                    raw_file = Some(std::io::BufWriter::new(f));
+                } else {
+                    ffmpeg = Some(FfmpegPipe::spawn(
+                        out_path, &ext, sink_w, sink_h, opts.fps, single_png,
+                    )?);
+                }
+            } else if fw != sink_w || fh != sink_h {
+                let needed = (sink_w as usize) * (sink_h as usize) * 4;
+                scratch.resize(needed, 0);
+            }
+
+            if opts.timestamp_overlay {
+                draw_timestamp_hud(&mut scratch, sink_w, sink_h, target_ns);
+            }
+
+            if let Some(f) = raw_file.as_mut() {
+                f.write_all(&scratch)?;
+            } else if let Some(pipe) = ffmpeg.as_mut() {
+                pipe.write_frame(&scratch)?;
+            }
+
+            frames += 1;
+            if single_png {
+                break;
+            }
+            if let Some(o) = outcome
+                && o.stop != ClusterStop::Paused
+            {
+                break;
+            }
+        }
+
+        if let Some(mut f) = raw_file {
+            f.flush()?;
+        }
+        if let Some(pipe) = ffmpeg {
+            pipe.finish(out_path)?;
+        }
+
+        Ok(VideoExportStats {
+            frames,
+            width: sink_w,
+            height: sink_h,
+            fps: opts.fps,
+            from_ns,
+            to_ns: last_ns,
+            non_blank_frames,
         })
     }
 
@@ -1448,6 +1664,14 @@ impl ClusterRun {
             };
             let mut cfg = nm.spec.config()?;
             cfg.net = Some(NetDeviceConfig { mac: nm.mac });
+            cfg.fb = if nm.display {
+                Some(FramebufferConfig {
+                    width: nm.display_width.unwrap_or(rewind_vmm::pv::FB_DEFAULT_WIDTH),
+                    height: nm.display_height.unwrap_or(rewind_vmm::pv::FB_DEFAULT_HEIGHT),
+                })
+            } else {
+                None
+            };
             nodes_cfg.push(ClusterNodeConfig {
                 name: nm.name.clone(),
                 config: cfg,
@@ -1897,6 +2121,264 @@ pub struct PcapStats {
     pub to_ns: u64,
 }
 
+/// Options controlling [`ClusterRun::export_video`].
+#[derive(Clone, Debug)]
+pub struct VideoExportOptions {
+    pub fps: u32,
+    pub from_ms: Option<u64>,
+    pub to_ms: Option<u64>,
+    /// Burn the virtual timestamp (`t = 00:04.233`) into the top-right corner.
+    pub timestamp_overlay: bool,
+}
+
+impl Default for VideoExportOptions {
+    fn default() -> VideoExportOptions {
+        VideoExportOptions {
+            fps: 30,
+            from_ms: None,
+            to_ms: None,
+            timestamp_overlay: false,
+        }
+    }
+}
+
+/// Summary returned by [`ClusterRun::export_video`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoExportStats {
+    pub frames: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub from_ns: u64,
+    pub to_ns: u64,
+    pub non_blank_frames: u64,
+}
+
+struct NoopObserver;
+impl ClusterObserver for NoopObserver {}
+
+fn pack_bgr0_frame(width: u32, height: u32, stride: u32, src: &[u8], dst: &mut Vec<u8>) {
+    let row_bytes = (width as usize) * 4;
+    let total = row_bytes * (height as usize);
+    dst.resize(total, 0);
+    if stride as usize == row_bytes && src.len() >= total {
+        dst.copy_from_slice(&src[..total]);
+    } else {
+        for y in 0..(height as usize) {
+            let s_off = y * (stride as usize);
+            let d_off = y * row_bytes;
+            if s_off + row_bytes <= src.len() {
+                dst[d_off..d_off + row_bytes].copy_from_slice(&src[s_off..s_off + row_bytes]);
+            }
+        }
+    }
+}
+
+struct FfmpegPipe {
+    child: std::process::Child,
+    stdin: Option<std::io::BufWriter<std::process::ChildStdin>>,
+}
+
+impl FfmpegPipe {
+    fn spawn(
+        out_path: &Path,
+        ext: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        single_png: bool,
+    ) -> Result<FfmpegPipe> {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr0",
+            "-s",
+            &format!("{width}x{height}"),
+        ]);
+        if !single_png {
+            cmd.args(["-r", &fps.to_string()]);
+        }
+        cmd.args(["-i", "-"]);
+        if single_png {
+            cmd.args(["-frames:v", "1"]);
+        } else {
+            match ext {
+                "mp4" | "mov" | "mkv" => {
+                    cmd.args([
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-crf",
+                        "20",
+                        "-preset",
+                        "fast",
+                        "-movflags",
+                        "+faststart",
+                    ]);
+                }
+                "webm" => {
+                    cmd.args([
+                        "-c:v",
+                        "libvpx-vp9",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-crf",
+                        "30",
+                        "-b:v",
+                        "0",
+                    ]);
+                }
+                "gif" => {
+                    cmd.args([
+                        "-vf",
+                        "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                    ]);
+                }
+                _ => {
+                    cmd.args(["-pix_fmt", "yuv420p"]);
+                }
+            }
+        }
+        cmd.arg(out_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().with_context(|| {
+            "spawning `ffmpeg` to encode deterministic screencast (install ffmpeg or export `.raw`)"
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("capturing ffmpeg stdin")?;
+        Ok(FfmpegPipe {
+            child,
+            stdin: Some(std::io::BufWriter::new(stdin)),
+        })
+    }
+
+    fn write_frame(&mut self, bgr0: &[u8]) -> Result<()> {
+        if let Some(stdin) = self.stdin.as_mut() {
+            stdin.write_all(bgr0).context("writing frame to ffmpeg")?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, out_path: &Path) -> Result<()> {
+        if let Some(mut stdin) = self.stdin.take() {
+            stdin.flush()?;
+        }
+        let output = self
+            .child
+            .wait_with_output()
+            .context("waiting for ffmpeg to finish encoding")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "ffmpeg failed encoding {} ({}): {}",
+                out_path.display(),
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Tiny 5×7 bitmap glyph table for zero-dependency virtual-time HUD stamps.
+fn hud_glyph(ch: u8) -> [u8; 7] {
+    match ch {
+        b'0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        b'1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+        b'3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+        b'4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        b'5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        b'6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        b'7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        b'8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        b'9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        b':' => [0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00],
+        b'.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
+        b't' => [0x04, 0x04, 0x1F, 0x04, 0x04, 0x05, 0x02],
+        b's' => [0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E, 0x00],
+        b'=' => [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
+        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        _ => [0; 7],
+    }
+}
+
+/// Stamps a crisp translucent virtual-time badge (`VT 00:04.233`) in the
+/// top-right corner of a packed `bgr0` frame.
+fn draw_timestamp_hud(buf: &mut [u8], width: u32, height: u32, ns: u64) {
+    let total_ms = ns / 1_000_000;
+    let mins = (total_ms / 60_000) % 100;
+    let secs = (total_ms / 1_000) % 60;
+    let ms = total_ms % 1_000;
+    let label = format!("VT {mins:02}:{secs:02}.{ms:03}");
+
+    let scale = 2usize;
+    let char_w = 6 * scale;
+    let char_h = 7 * scale;
+    let pad_x = 10usize;
+    let pad_y = 6usize;
+    let box_w = label.len() * char_w + pad_x * 2 - scale;
+    let box_h = char_h + pad_y * 2;
+    let margin = 12usize;
+    let w = width as usize;
+    let h = height as usize;
+    if w < box_w + margin * 2 || h < box_h + margin * 2 {
+        return;
+    }
+    let x0 = w - box_w - margin;
+    let y0 = margin;
+
+    // Dark translucent pill (75% black blend).
+    for y in y0..(y0 + box_h) {
+        for x in x0..(x0 + box_w) {
+            let off = (y * w + x) * 4;
+            if off + 4 <= buf.len() {
+                buf[off] /= 4;
+                buf[off + 1] /= 4;
+                buf[off + 2] /= 4;
+            }
+        }
+    }
+    // Crisp bright cyan-white text (`R=240, G=248, B=255`).
+    for (ci, ch) in label.bytes().enumerate() {
+        let glyph = hud_glyph(ch);
+        let gx = x0 + pad_x + ci * char_w;
+        let gy = y0 + pad_y;
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..5usize {
+                if (bits & (1 << (4 - col))) != 0 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let px = gx + col * scale + sx;
+                            let py = gy + row * scale + sy;
+                            let off = (py * w + px) * 4;
+                            if off + 4 <= buf.len() {
+                                buf[off] = 255;     // B
+                                buf[off + 1] = 248; // G
+                                buf[off + 2] = 240; // R
+                                buf[off + 3] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Nanosecond-resolution libpcap magic (`0xa1b23c4d`, little-endian).
 const PCAP_MAGIC_NSEC: u32 = 0xa1b2_3c4d;
 const PCAP_VERSION_MAJOR: u16 = 2;
@@ -2123,5 +2605,26 @@ mod pcap_tests {
         assert_eq!(u32::from_le_bytes(buf[32..36].try_into().unwrap()), 60);
         assert_eq!(u32::from_le_bytes(buf[36..40].try_into().unwrap()), 60);
         assert_eq!(&buf[40..], &frame);
+    }
+
+    #[test]
+    fn pack_bgr0_and_timestamp_hud_render_deterministically() {
+        let mut src = vec![0u8; 320 * 4 * 64];
+        for px in src.as_chunks_mut::<4>().0 {
+            *px = [0x10, 0x20, 0x30, 0x00];
+        }
+        let mut dst = Vec::new();
+        pack_bgr0_frame(300, 64, 320 * 4, &src, &mut dst);
+        assert_eq!(dst.len(), 300 * 64 * 4);
+        assert_eq!(&dst[0..4], &[0x10, 0x20, 0x30, 0x00]);
+
+        let mut hud_a = dst.clone();
+        let mut hud_b = dst.clone();
+        draw_timestamp_hud(&mut hud_a, 300, 64, 4_233_000_000);
+        draw_timestamp_hud(&mut hud_b, 300, 64, 4_233_000_000);
+        assert_eq!(hud_a, hud_b);
+        assert_ne!(hud_a, dst);
+        // Top-left pixel (far from top-right HUD badge) stays untouched.
+        assert_eq!(&hud_a[0..4], &[0x10, 0x20, 0x30, 0x00]);
     }
 }

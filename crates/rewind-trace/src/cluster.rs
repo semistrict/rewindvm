@@ -180,6 +180,15 @@ pub struct NodeSpecFile {
     /// `"service"` (default) or `"driver"`.
     #[serde(default)]
     pub role: Option<String>,
+    /// Attach a paravirtual framebuffer (`/dev/fb0`) for deterministic video capture.
+    #[serde(default)]
+    pub display: bool,
+    /// Optional framebuffer width in pixels (default 1280 when `display` is true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_width: Option<u32>,
+    /// Optional framebuffer height in pixels (default 720 when `display` is true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_height: Option<u32>,
     #[serde(default)]
     pub files: Vec<NodeFileSpec>,
 }
@@ -236,6 +245,12 @@ pub struct ClusterNodeManifest {
     pub role: String,
     pub clock_skew_ns: i64,
     pub clock_drift_ppm: i32,
+    #[serde(default)]
+    pub display: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_height: Option<u32>,
     pub spec: Spec,
 }
 
