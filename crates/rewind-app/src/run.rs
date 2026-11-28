@@ -464,6 +464,10 @@ pub struct Session {
     pub unopened_compare: Option<String>,
     /// Whether this build of rewind brings the run to a step as recorded.
     pub replays: Replays,
+    /// Multi-node cluster context when this run belongs to a recorded cluster.
+    pub cluster: Option<Arc<crate::cluster::ClusterData>>,
+    /// Index of `self.run` inside `cluster.nodes`, when `cluster` is `Some`.
+    pub cluster_node: Option<usize>,
 }
 
 /// Which program's events a session compares its two runs by.
@@ -535,12 +539,64 @@ impl Session {
             rows,
             unopened_compare: None,
             replays: Replays::AsRecorded,
+            cluster: None,
+            cluster_node: None,
         }
     }
 
-    /// Opens a run and the run to compare it with: the one given, else
-    /// the run it was forked from when that is next to it, else none.
+    /// Opens a specific node of an already-loaded cluster as a `Session`.
+    pub fn open_cluster_node(
+        cluster: Arc<crate::cluster::ClusterData>,
+        node_idx: usize,
+    ) -> Result<Session> {
+        let node = cluster
+            .nodes
+            .get(node_idx)
+            .with_context(|| format!("cluster has no node index {node_idx}"))?;
+        let run = Run::open(&node.run_dir)?;
+        let mut session = Session::new(run, None);
+        session.cluster = Some(cluster);
+        session.cluster_node = Some(node_idx);
+        Ok(session)
+    }
+
+    /// Opens a run (or multi-node cluster directory / cluster node) and the run
+    /// to compare it with: the one given, else the run it was forked from when
+    /// that is next to it, else none.
     pub fn open(path: &Path, compare: Option<&Path>) -> Result<Session> {
+        if let Some((cluster_dir, detected_node)) = crate::cluster::ClusterData::detect(path) {
+            let cluster = Arc::new(crate::cluster::ClusterData::open(&cluster_dir)?);
+            let node_idx = detected_node
+                .as_deref()
+                .and_then(|name| cluster.node_idx_by_name(name))
+                .unwrap_or_else(|| cluster.default_node_idx());
+            let node = cluster
+                .nodes
+                .get(node_idx)
+                .with_context(|| format!("cluster {} has no nodes", cluster_dir.display()))?;
+            let run = Run::open(&node.run_dir)?;
+            let compare_path = compare.map(|c| {
+                if let Some((cmp_cluster_dir, cmp_node)) = crate::cluster::ClusterData::detect(c)
+                    && cmp_node.is_none()
+                    && let Ok(cmp_cluster) = crate::cluster::ClusterData::open(&cmp_cluster_dir)
+                    && let Some(idx) = cmp_cluster.node_idx_by_name(&node.name)
+                {
+                    return cmp_cluster.nodes[idx].run_dir.clone();
+                }
+                c.to_path_buf()
+            });
+            let (other, unopened) = match compare_path.as_deref().map(Run::open) {
+                None => (None, None),
+                Some(Ok(other)) => (Some(other), None),
+                Some(Err(e)) => (None, Some(format!("{e:#}"))),
+            };
+            let mut session = Session::new(run, other);
+            session.unopened_compare = unopened;
+            session.cluster = Some(cluster);
+            session.cluster_node = Some(node_idx);
+            return Ok(session);
+        }
+
         let run = Run::open(path)?;
         let compare = compare.map(Path::to_path_buf).or_else(|| run.parent_dir());
 
@@ -575,9 +631,20 @@ impl Session {
     /// views part at the same events. Without a compared run, itself.
     pub fn swapped(self) -> Session {
         let program = self.comparison.as_ref().and_then(|c| c.program.clone());
+        let cluster = self.cluster;
+        let cluster_node = self.cluster_node;
         match self.other {
-            Some(other) => Session::compared(other, Some(self.run), Program::Given(program)),
-            None => self,
+            Some(other) => {
+                let mut session = Session::compared(other, Some(self.run), Program::Given(program));
+                session.cluster = cluster;
+                session.cluster_node = cluster_node;
+                session
+            }
+            None => Session {
+                cluster,
+                cluster_node,
+                ..self
+            },
         }
     }
 
@@ -592,6 +659,8 @@ impl Session {
             None => Session::new(run, None),
         };
         session.replays = self.replays;
+        session.cluster = self.cluster;
+        session.cluster_node = self.cluster_node;
         session
     }
 

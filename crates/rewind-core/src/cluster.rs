@@ -672,6 +672,9 @@ pub fn prepare_cluster(
                 gateway: None,
                 hosts: hosts.clone(),
             }),
+            disk_mount: n
+                .disk_mib
+                .map(|_| n.disk_mount.clone().unwrap_or_else(|| "/data".into())),
         };
 
         let node_seed = mix64(opts.seed ^ (idx as u64).wrapping_add(1));
@@ -714,6 +717,7 @@ pub fn prepare_cluster(
         } else {
             None
         };
+        cfg.disk_mib = n.disk_mib;
 
         let skew_ns = n.clock_skew_ms.saturating_mul(1_000_000);
         node_manifests.push(ClusterNodeManifest {
@@ -729,6 +733,8 @@ pub fn prepare_cluster(
             display: n.display,
             display_width: n.display_width,
             display_height: n.display_height,
+            disk_mib: n.disk_mib,
+            disk_mount: n.disk_mount.clone(),
             spec,
         });
         node_configs.push(ClusterNodeConfig {
@@ -821,6 +827,13 @@ pub(crate) fn compute_cluster_id(
                     .to_le_bytes(),
             );
         }
+        if let Some(mib) = n.disk_mib {
+            hasher.update(b"disk");
+            hasher.update(&mib.to_le_bytes());
+            if let Some(m) = &n.disk_mount {
+                hasher.update(m.as_bytes());
+            }
+        }
         hasher.update(n.spec.id().as_bytes());
     }
     hasher.update(network_json.to_string().as_bytes());
@@ -850,6 +863,7 @@ pub fn config_from_manifest(manifest: &ClusterManifest) -> Result<ClusterConfig>
         } else {
             None
         };
+        cfg.disk_mib = n.disk_mib;
         nodes.push(ClusterNodeConfig {
             name: n.name.clone(),
             config: cfg,
@@ -1746,6 +1760,7 @@ impl ClusterRun {
             } else {
                 None
             };
+            cfg.disk_mib = nm.disk_mib;
             nodes_cfg.push(ClusterNodeConfig {
                 name: nm.name.clone(),
                 config: cfg,

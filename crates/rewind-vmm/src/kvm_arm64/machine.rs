@@ -220,6 +220,9 @@ impl Machine {
                 event_buffer: Vec::new(),
                 net_config: config.net,
                 fb_region,
+                disk: config.disk_mib.map(|mib| {
+                    std::sync::Arc::new(std::sync::Mutex::new(crate::disk::VirtualDisk::new(mib)))
+                }),
                 net_rx_ring: None,
                 net_rx_slots: 0,
                 tx_queue: std::collections::VecDeque::new(),
@@ -378,6 +381,17 @@ impl Machine {
 
     pub fn set_cluster_mode(&mut self, enabled: bool) {
         self.dev.cluster_mode = enabled;
+    }
+
+    pub fn set_disk(&mut self, disk: std::sync::Arc<std::sync::Mutex<crate::disk::VirtualDisk>>) {
+        self.dev.disk = Some(disk);
+    }
+
+    pub fn disk_stats(&self) -> Option<crate::disk::DiskStats> {
+        self.dev
+            .disk
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|g| g.stats()))
     }
 
     pub fn encoders(
@@ -1024,6 +1038,7 @@ mod tests {
             extras: crate::Extras::Absent,
             net: None,
             fb: None,
+            disk_mib: None,
         }
     }
 

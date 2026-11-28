@@ -8,6 +8,7 @@ mod band;
 mod blame;
 mod bookmarks;
 mod chrome;
+mod cluster;
 mod compare;
 #[cfg(any(target_family = "wasm", test))]
 mod desktop;

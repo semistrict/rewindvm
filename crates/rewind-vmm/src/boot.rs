@@ -433,6 +433,7 @@ mod tests {
             pmem_len: 0,
             extras_len: 0,
             fb: None,
+            disk_mib: None,
         }
     }
 

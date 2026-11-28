@@ -367,6 +367,11 @@ pub struct Scrubber {
     /// The families of the engine's runs, the one changed last first, for
     /// the empty state.
     pub(super) recent: Vec<Family>,
+    /// Recorded multi-node clusters under `$REWIND_HOME/clusters/`, newest
+    /// first, for the empty state.
+    pub(super) recent_clusters: Vec<crate::cluster::ClusterEntry>,
+    /// UI state for the Cluster tab (filter + scroll + swimlane hitbox).
+    pub(super) cluster_panel: crate::ui::cluster::ClusterPanel,
     /// The empty state's field that filters the families it lists.
     pub(super) recent_filter: Entity<TextInput>,
     /// Draws the list again as the filter is typed into.
@@ -597,6 +602,8 @@ impl Scrubber {
             place_answers: Answers::default(),
             link_dialog: None,
             recent: Vec::new(),
+            recent_clusters: Vec::new(),
+            cluster_panel: crate::ui::cluster::ClusterPanel::default(),
             runs: RunsPanel::default(),
             right_tab: RightTab::AtStep,
             runs_tab: false,
@@ -721,14 +728,27 @@ impl Scrubber {
             self.search_index.another_run();
             self.blames.leave_run();
         }
+        let same_cluster = self
+            .session
+            .as_ref()
+            .and_then(|s| s.cluster.as_ref())
+            .map(|c| &c.dir)
+            == session.cluster.as_ref().map(|c| &c.dir);
         self.step = start;
         let keeps = match self.right_tab {
             RightTab::Runs | RightTab::Bookmarks | RightTab::Threads | RightTab::Time => true,
+            RightTab::Cluster => session.cluster.is_some(),
             RightTab::Compare => session.other.is_some(),
             RightTab::AtStep | RightTab::File | RightTab::FileDiff | RightTab::Source => false,
         };
         if !keeps {
             self.right_tab = RightTab::AtStep;
+        }
+        // Landing on a newly opened cluster opens the Cluster tab automatically
+        // so the multi-node swimlane & network stream are immediately visible.
+        if session.cluster.is_some() && !same_cluster {
+            self.cluster_panel = crate::ui::cluster::ClusterPanel::default();
+            self.right_tab = RightTab::Cluster;
         }
         self.selecting.selection = None;
 
@@ -846,14 +866,18 @@ impl Scrubber {
             return;
         };
         let read = cx.background_executor().spawn(async move {
-            crate::engine::runs_dir()
+            let runs = crate::engine::runs_dir()
                 .map(|dir| scan(&dir))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let clusters = crate::engine::clusters_dir()
+                .map(|dir| crate::cluster::scan_clusters(&dir))
+                .unwrap_or_default();
+            (runs, clusters)
         });
         cx.spawn(async move |this, cx| {
-            let runs = read.await;
+            let (runs, clusters) = read.await;
             let _ = this.update(cx, |this, cx| match this.runs_readings.finished(request) {
-                Finished::Show => this.apply_runs(runs, cx),
+                Finished::Show => this.apply_runs(runs, clusters, cx),
                 Finished::ReadAgain => this.read_runs(Reread::Changed, cx),
                 Finished::Drop => {}
             });
@@ -861,9 +885,15 @@ impl Scrubber {
         .detach();
     }
 
-    /// Shows `runs`, the engine's runs: the families the empty state lists
-    /// and the family of the run on screen.
-    fn apply_runs(&mut self, runs: Vec<RunEntry>, cx: &mut Context<Self>) {
+    /// Shows `runs` and `clusters`, the engine's recorded runs and multi-node
+    /// clusters: the empty state lists both and the Runs panel shows the family
+    /// of the run on screen.
+    fn apply_runs(
+        &mut self,
+        runs: Vec<RunEntry>,
+        clusters: Vec<crate::cluster::ClusterEntry>,
+        cx: &mut Context<Self>,
+    ) {
         let running = runs.iter().any(|r| r.progress == Progress::Running);
         let origin = self.session.as_ref().map(|s| &s.run.origin);
         if origin != Some(&Origin::Example) {
@@ -877,6 +907,7 @@ impl Scrubber {
                 .set_family(shown.and_then(|id| family_of(runs.clone(), &id)));
         }
         self.recent = families(runs);
+        self.recent_clusters = clusters;
         if running {
             self.watch_running(cx);
         }
@@ -1236,8 +1267,12 @@ impl Scrubber {
             return;
         };
         let replays = session.replays;
+        let cluster = session.cluster;
+        let cluster_node = session.cluster_node;
         let mut alone = Session::new(session.run, None);
         alone.replays = replays;
+        alone.cluster = cluster;
+        alone.cluster_node = cluster_node;
         self.session = Some(alone);
         self.close_comparison_tabs();
 
@@ -1361,10 +1396,17 @@ impl Scrubber {
         .detach();
     }
 
-    /// Sets the window title to the run's name when it changes.
+    /// Sets the window title to the run's (or cluster + node's) name when it changes.
     pub(super) fn sync_title(&mut self, window: &mut Window) {
         let title = match &self.session {
-            Some(s) => format!("Rewind \u{b7} {}", s.run.label()),
+            Some(s) => match (&s.cluster, s.cluster_node) {
+                (Some(c), Some(idx)) => format!(
+                    "Rewind \u{b7} {} \u{b7} {}",
+                    c.manifest.name,
+                    c.node_name(idx)
+                ),
+                _ => format!("Rewind \u{b7} {}", s.run.label()),
+            },
             None => "Rewind".to_string(),
         };
         if self.title.as_deref() == Some(title.as_str()) {
@@ -1402,6 +1444,7 @@ impl Scrubber {
             RightTab::Source => self.source_playhead_moved(cx),
             RightTab::Threads => self.lanes_playhead_moved(cx),
             RightTab::AtStep
+            | RightTab::Cluster
             | RightTab::Compare
             | RightTab::Runs
             | RightTab::Bookmarks

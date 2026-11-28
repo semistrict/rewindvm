@@ -83,6 +83,8 @@ fn node_spec(name: &str, ip: &str, role: &str, cmd: &str, skew_ms: i64, drift_pp
         display: false,
         display_width: None,
         display_height: None,
+        disk_mib: None,
+        disk_mount: None,
         files: Vec::new(),
     }
 }

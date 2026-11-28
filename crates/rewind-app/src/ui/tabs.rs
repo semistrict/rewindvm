@@ -32,6 +32,8 @@ const CLOSE_PAD: f32 = 4.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightTab {
     AtStep,
+    /// Multi-node cluster overview: synced swimlanes + L2 network/fault stream.
+    Cluster,
     /// The two runs' events side by side, while a run is compared.
     Compare,
     Runs,
@@ -57,6 +59,7 @@ impl RightTab {
             RightTab::Threads => Some(Tab::Threads),
             RightTab::Time => Some(Tab::Time),
             RightTab::AtStep
+            | RightTab::Cluster
             | RightTab::Runs
             | RightTab::File
             | RightTab::FileDiff
@@ -91,7 +94,11 @@ impl Scrubber {
             RightTab::Source => self.source_playhead_moved(cx),
             RightTab::Threads => self.lanes_playhead_moved(cx),
             RightTab::Time => self.ensure_time(cx),
-            RightTab::AtStep | RightTab::Compare | RightTab::Runs | RightTab::Bookmarks => {}
+            RightTab::AtStep
+            | RightTab::Cluster
+            | RightTab::Compare
+            | RightTab::Runs
+            | RightTab::Bookmarks => {}
         }
         cx.notify();
     }
@@ -119,14 +126,17 @@ impl Scrubber {
                 }
                 cx.notify();
             }
-            RightTab::AtStep | RightTab::Compare => {}
+            RightTab::AtStep | RightTab::Cluster | RightTab::Compare => {}
         }
     }
 
-    /// The tabs there are: "At this step" always, and the runs, the file
-    /// and the source while they are open.
+    /// The tabs there are: "At this step" always, and the cluster, compare,
+    /// runs, file and source while they are open.
     fn tabs(&self) -> Vec<RightTab> {
         let mut tabs = vec![RightTab::AtStep];
+        if self.session.as_ref().is_some_and(|s| s.cluster.is_some()) {
+            tabs.push(RightTab::Cluster);
+        }
         if self.session.as_ref().is_some_and(|s| s.other.is_some()) {
             tabs.push(RightTab::Compare);
         }
@@ -157,6 +167,10 @@ impl Scrubber {
     fn tab_label(&self, tab: RightTab) -> String {
         match tab {
             RightTab::AtStep => "At this step".to_string(),
+            RightTab::Cluster => match self.session.as_ref().and_then(|s| s.cluster.as_ref()) {
+                Some(c) => format!("Cluster \u{b7} {}", c.nodes.len()),
+                None => "Cluster".to_string(),
+            },
             RightTab::Compare => "Compare".to_string(),
             RightTab::Runs => match &self.runs.family {
                 Some(family) => format!("Runs \u{b7} {}", family.runs.len()),
@@ -199,7 +213,7 @@ impl Scrubber {
             .text_size(px(size::TEXT_SMALL));
         for tab in self.tabs() {
             let chosen = tab == self.right_tab;
-            let closable = !matches!(tab, RightTab::AtStep | RightTab::Compare);
+            let closable = !matches!(tab, RightTab::AtStep | RightTab::Cluster | RightTab::Compare);
             let name = format!("{tab:?}");
             let mut item = div()
                 .id(SharedString::from(format!("tab-{name}")))

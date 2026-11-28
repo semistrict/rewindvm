@@ -39,6 +39,9 @@ pub const HOME_ENV: &str = "REWIND_HOME";
 /// Where runs live inside a Rewind home.
 const RUNS_DIR: &str = "runs";
 
+/// Where multi-node clusters live inside a Rewind home.
+const CLUSTERS_DIR: &str = "clusters";
+
 /// The home the engine uses when REWIND_HOME is not set, under the XDG
 /// data directory.
 const DEFAULT_HOME_DIR: &str = "rewind";
@@ -1265,6 +1268,12 @@ fn locate_run(id: &str, parent: &Path) -> Option<PathBuf> {
 /// is set, else under the default home.
 pub fn runs_dir() -> Option<PathBuf> {
     Some(home_from(|n| std::env::var_os(n))?.join(RUNS_DIR))
+}
+
+/// The directory the engine keeps its multi-node clusters in: under
+/// REWIND_HOME when it is set, else under the default home.
+pub fn clusters_dir() -> Option<PathBuf> {
+    Some(home_from(|n| std::env::var_os(n))?.join(CLUSTERS_DIR))
 }
 
 /// The variable `name` through `var`, when it names something: one set to

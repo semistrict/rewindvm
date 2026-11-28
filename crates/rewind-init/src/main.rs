@@ -25,6 +25,11 @@ use rewind_init::{
 
 /// The image the monitor maps as persistent memory.
 const IMAGE_DEVICE: &str = "/dev/pmem0";
+/// The paravirtual crash-consistent block device attached when a node has
+/// `disk_mib` configured.
+const DISK_DEVICE: &str = "/dev/rwd0";
+/// Static `mke2fs` bundled in the initramfs to format blank virtual disks as ext4.
+const MKE2FS_BIN: &str = "/rewind/tools/mke2fs";
 
 /// How long to wait for the image device, in virtual time. The nvdimm bus
 /// registers its devices from an async domain the kernel does not wait on
@@ -170,6 +175,9 @@ fn run() -> Result<()> {
     };
 
     let (uid, gid) = job.host_ids();
+    if let Some(mount_point) = &job.disk_mount {
+        mount_disk(root, mount_point, uid, gid)?;
+    }
     for f in &job.files {
         let path = within(root, &f.path);
         if let Some(parent) = path.parent() {
@@ -238,6 +246,68 @@ fn store_root(job: &Job) -> Result<()> {
 /// A path inside the job's root, as init sees it.
 fn within(root: &str, path: &str) -> PathBuf {
     Path::new(root).join(path.trim_start_matches('/'))
+}
+
+/// Waits for `/dev/rwd0`, formats it as deterministic ext4 on first boot (when
+/// the ext4 superblock magic `0xEF53` is absent) and flushes the formatted
+/// filesystem to durable storage, then mounts it at `mount_point` inside `root`.
+fn mount_disk(root: &str, mount_point: &str, uid: u32, gid: u32) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    wait_for(DISK_DEVICE)?;
+    let mut magic = [0u8; 2];
+    {
+        let mut dev = File::open(DISK_DEVICE).map_err(|e| format!("opening {DISK_DEVICE}: {e}"))?;
+        dev.seek(SeekFrom::Start(1024 + 56))
+            .map_err(|e| format!("seeking {DISK_DEVICE}: {e}"))?;
+        dev.read_exact(&mut magic)
+            .map_err(|e| format!("reading superblock magic of {DISK_DEVICE}: {e}"))?;
+    }
+    let formatted = magic == [0x53, 0xEF];
+    if !formatted {
+        let status = Command::new(MKE2FS_BIN)
+            .args([
+                "-t",
+                "ext4",
+                "-q",
+                "-F",
+                "-U",
+                "00000000-0000-4000-8000-000000000001",
+                "-E",
+                "hash_seed=00000000-0000-4000-8000-000000000001,lazy_itable_init=0,lazy_journal_init=0",
+                DISK_DEVICE,
+            ])
+            .env("SOURCE_DATE_EPOCH", "0")
+            .env("E2FSPROGS_FAKE_TIME", "1700000000")
+            .status()
+            .map_err(|e| format!("running {MKE2FS_BIN} on {DISK_DEVICE}: {e}"))?;
+        if !status.success() {
+            return Err(format!("{MKE2FS_BIN} on {DISK_DEVICE} exited with {status}"));
+        }
+        // Commit the freshly formatted ext4 superblock & journal to durable
+        // storage so a subsequent power loss never loses the filesystem itself.
+        let dev = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(DISK_DEVICE)
+            .map_err(|e| format!("reopening {DISK_DEVICE} for fsync: {e}"))?;
+        dev.sync_all()
+            .map_err(|e| format!("fsyncing {DISK_DEVICE}: {e}"))?;
+    }
+
+    let target = within(root, mount_point);
+    let target_str = target.to_string_lossy().into_owned();
+    fs::create_dir_all(&target).map_err(|e| format!("creating {target_str}: {e}"))?;
+    mount(DISK_DEVICE, &target_str, "ext4", 0, "")?;
+    if !formatted {
+        chown(&target_str, uid, gid)?;
+        chmod(&target_str, 0o1777)?;
+        // Persist the initial root directory mode/owner on boot #1.
+        if let Ok(dir) = File::open(&target) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Image mode: the image is a root filesystem; overlay it writable at
@@ -2098,6 +2168,7 @@ mod tests {
             output: Output::Terminal,
             sandbox: Sandbox::Shared,
             net: None,
+            disk_mount: None,
         };
         assert_eq!(
             resolve(&job, "/").unwrap(),

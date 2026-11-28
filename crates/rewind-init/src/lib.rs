@@ -401,6 +401,10 @@ pub struct Job {
     /// Absent on single-node runs so their job files stay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<NetConfig>,
+    /// Optional mount point inside the job's root for the paravirtual
+    /// crash-consistent block device (`/dev/rwd0`, formatted as ext4 on first boot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_mount: Option<String>,
 }
 
 /// Network interface and peer hostname configuration for a node in a cluster.
@@ -1206,6 +1210,7 @@ mod tests {
             output: Output::Plain,
             sandbox,
             net: None,
+            disk_mount: None,
         }
     }
 

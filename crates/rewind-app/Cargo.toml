@@ -57,7 +57,7 @@ zstd = "0.13"
 # .rwd exports from https URLs, with rustls and compiled-in root
 # certificates, as the engine fetches them.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["wayland", "x11"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["wayland", "x11", "font-kit", "runtime_shaders"] }
 
 # The browser build, src/bin/rewind-web.rs: a read-only viewer of .rwd
 # exports on GPUI's web platform, for the site's viewer page.

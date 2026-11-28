@@ -140,6 +140,8 @@ class Cluster:
         display: bool = False,
         display_width: Optional[int] = None,
         display_height: Optional[int] = None,
+        disk_mib: Optional[int] = None,
+        disk_mount: Optional[str] = None,
         files: Optional[Dict[str, str]] = None,
     ) -> NodeHandle:
         """Registers a node before calling :meth:`start`."""
@@ -191,6 +193,10 @@ class Cluster:
             node["display_width"] = display_width
         if display_height is not None:
             node["display_height"] = display_height
+        if disk_mib is not None:
+            node["disk_mib"] = disk_mib
+        if disk_mount is not None:
+            node["disk_mount"] = disk_mount
         self._nodes.append(node)
         return NodeHandle(self, name)
 
@@ -480,6 +486,12 @@ class Cluster:
 
     async def restart(self, node: str) -> Dict[str, Any]:
         return await self._rpc.call("cluster.restart", {"node": node})
+
+    async def disk_stats(self, node: str) -> Optional[Dict[str, Any]]:
+        """Returns I/O and power-loss cache statistics for ``node``'s paravirtual
+        disk (``/dev/rwd0``), or ``None`` if no disk was attached."""
+        res = await self._rpc.call("cluster.disk_stats", {"node": node})
+        return res.get("disk")
 
     async def clog_link(
         self,

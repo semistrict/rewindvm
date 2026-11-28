@@ -216,6 +216,8 @@ struct NodeStartParams {
     display: bool,
     display_width: Option<u32>,
     display_height: Option<u32>,
+    disk_mib: Option<u64>,
+    disk_mount: Option<String>,
     #[serde(default)]
     files: Vec<NodeFileSpec>,
 }
@@ -290,6 +292,8 @@ fn dispatch(
                         display: n.display,
                         display_width: n.display_width,
                         display_height: n.display_height,
+                        disk_mib: n.disk_mib,
+                        disk_mount: n.disk_mount,
                         files: n.files,
                     })
                     .collect(),
@@ -576,6 +580,20 @@ fn dispatch(
                 "cluster_ns": st.cluster_ns,
                 "cluster_step": st.cluster_step,
                 "boot_count": boot_count,
+            }))
+        }
+        "cluster.disk_stats" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+            }
+            let p: P =
+                serde_json::from_value(params).context("invalid params for cluster.disk_stats")?;
+            let s = require_session(session)?;
+            let stats = s.disk_stats(&p.node)?;
+            Ok(json!({
+                "node": p.node,
+                "disk": stats,
             }))
         }
         "cluster.clog_link" => {

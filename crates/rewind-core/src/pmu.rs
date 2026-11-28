@@ -552,6 +552,7 @@ fn selftest_spec(guest: &Guest) -> Spec {
             output: rewind_init::Output::Plain,
             sandbox: rewind_init::Sandbox::Shared,
             net: None,
+            disk_mount: None,
         },
     }
 }

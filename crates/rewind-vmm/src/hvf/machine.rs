@@ -41,6 +41,7 @@ enum ExitAction {
 const HVC_EMIT: u16 = pv::PORT_EMIT;
 const HVC_CLOCK: u16 = pv::PORT_CLOCK;
 const HVC_NET_TX: u16 = pv::PORT_NET_TX;
+const HVC_BLK_REQ: u16 = pv::PORT_BLK_REQ;
 const HVC_TIMER: u16 = pv::PORT_TIMER;
 const HVC_IDLE: u16 = pv::PORT_IDLE;
 const HVC_EXIT: u16 = pv::PORT_EXIT;
@@ -202,6 +203,9 @@ impl Machine {
                 event_buffer: Vec::new(),
                 net_config: config.net,
                 fb_region,
+                disk: config.disk_mib.map(|mib| {
+                    Arc::new(std::sync::Mutex::new(crate::disk::VirtualDisk::new(mib)))
+                }),
                 net_rx_ring: None,
                 net_rx_slots: 0,
                 tx_queue: std::collections::VecDeque::new(),
@@ -332,6 +336,17 @@ impl Machine {
 
     pub fn set_cluster_mode(&mut self, enabled: bool) {
         self.dev.cluster_mode = enabled;
+    }
+
+    pub fn set_disk(&mut self, disk: Arc<std::sync::Mutex<crate::disk::VirtualDisk>>) {
+        self.dev.disk = Some(disk);
+    }
+
+    pub fn disk_stats(&self) -> Option<crate::disk::DiskStats> {
+        self.dev
+            .disk
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|g| g.stats()))
     }
 
     pub fn encoders(
@@ -686,7 +701,13 @@ impl Machine {
                     HVC_SERIAL => {
                         obs.serial(self.dev.step, arg as u8);
                     }
-                    HVC_EMIT | HVC_NET_TX | HVC_TIMER | HVC_IDLE | HVC_EXIT | HVC_SETUP => {
+                    HVC_EMIT
+                    | HVC_NET_TX
+                    | HVC_BLK_REQ
+                    | HVC_TIMER
+                    | HVC_IDLE
+                    | HVC_EXIT
+                    | HVC_SETUP => {
                         self.dev.io_out_u64(imm, arg, obs)?;
                     }
                     other => {
@@ -734,7 +755,13 @@ impl Machine {
                         };
                         match port {
                             HVC_SERIAL => obs.serial(self.dev.step, arg as u8),
-                            HVC_EMIT | HVC_NET_TX | HVC_TIMER | HVC_IDLE | HVC_EXIT | HVC_SETUP => {
+                            HVC_EMIT
+                    | HVC_NET_TX
+                    | HVC_BLK_REQ
+                    | HVC_TIMER
+                    | HVC_IDLE
+                    | HVC_EXIT
+                    | HVC_SETUP => {
                                 self.dev.io_out_u64(port, arg, obs)?;
                             }
                             other => {
@@ -1054,6 +1081,7 @@ mod tests {
             extras: crate::Extras::Absent,
             net: None,
             fb: None,
+            disk_mib: None,
         }
     }
 

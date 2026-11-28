@@ -216,6 +216,7 @@ impl Scrubber {
         let splits = self.splits;
         let wide = splits.right * layout::LOG_FLEX / layout::SIDE_FLEX;
         let chosen = match self.right_tab {
+            RightTab::Cluster => self.render_cluster_tab(cx),
             RightTab::File => self.render_viewer(cx),
             RightTab::FileDiff => self.render_file_diff(cx),
             RightTab::Source => self.render_source(cx),
@@ -270,6 +271,7 @@ impl Scrubber {
             .child(at_step_column)
             .child(measure(|m| &m.panels, &self.measured));
 
+        let cluster_bar = self.render_cluster_bar(cx);
         // The terminal pane, while a shell or gdb runs, under the panels.
         let terminal = self.render_terminal(window, cx);
         div()
@@ -278,6 +280,7 @@ impl Scrubber {
             .flex_col()
             .size_full()
             .child(header)
+            .children(cluster_bar)
             .child(timeline)
             .child(panels)
             .children(terminal)
@@ -2053,6 +2056,9 @@ impl Scrubber {
                     .child(open_file)
                     .child(open_link),
             )
+            .when(!self.recent_clusters.is_empty(), |d| {
+                d.child(self.render_recent_clusters(cx))
+            })
             .when(!self.recent.is_empty(), |d| d.child(self.render_recent(cx)));
 
         // The browser viewer lists the examples beside it; the desktop app
@@ -2171,6 +2177,136 @@ impl Scrubber {
 }
 
 impl Scrubber {
+    /// Recorded multi-node clusters under `$REWIND_HOME/clusters/`, newest
+    /// first. When clusters are present, this card holds the shared filter
+    /// input (so `recent_filter` is never mounted twice in one frame).
+    fn render_recent_clusters(&self, cx: &mut Context<Self>) -> Div {
+        let now = crate::clock::now();
+        let query = self.recent_filter.read(cx).text().to_string();
+        let shown: Vec<(usize, &crate::cluster::ClusterEntry)> = self
+            .recent_clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matches(&query))
+            .collect();
+        let filter = div()
+            .p(px(size::NOTICE_PAD / 2.0))
+            .rounded(px(size::RADIUS_BUTTON))
+            .bg(rgb(theme::BG))
+            .border_1()
+            .border_color(rgb(theme::LINE_2))
+            .text_color(rgb(theme::TEXT))
+            .child(self.recent_filter.clone());
+        let count = match (shown.len(), self.recent_clusters.len()) {
+            (n, all) if n == all => format!("{all} clusters"),
+            (n, all) => format!("{n} of {all} clusters"),
+        };
+        let mut rows = div()
+            .id("recent-cluster-rows")
+            .flex()
+            .flex_col()
+            .max_h(px(size::RECENT_MAX_HEIGHT))
+            .overflow_y_scroll();
+        for (i, entry) in shown {
+            let (headline, failed) = entry.headline();
+            let tone = if failed {
+                PillTone::Failed
+            } else {
+                PillTone::Passed
+            };
+            let when = now
+                .duration_since(entry.modified)
+                .map(crate::describe::ago)
+                .unwrap_or_default();
+            let detail = format!(
+                "{} nodes \u{b7} {} \u{b7} {} faults \u{b7} {} tx",
+                entry.node_count,
+                crate::cluster::format_virtual_ns(entry.virtual_ns),
+                entry.fault_count,
+                thousands(entry.tx_frames),
+            );
+            rows = rows.child(
+                div()
+                    .id(SharedString::from(format!("recent-cluster-{i}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(size::CONTROL_GAP))
+                    .px(px(size::RECENT_ROW_PAD_X))
+                    .py(px(size::RECENT_ROW_PAD_Y))
+                    .rounded(px(size::RADIUS_CARD))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::RAISED_HOVER)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(size::RECENT_ENDING_WIDTH))
+                            .child(pill(headline, tone, &self.fonts)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(self.fonts.mono.clone())
+                            .text_size(px(size::TEXT_SMALL))
+                            .text_color(rgb(theme::MUTED))
+                            .child(short_id(&entry.id)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_grow(layout::FILL)
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(theme::SOFT))
+                                    .child(entry.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(size::TEXT_SMALL))
+                                    .text_color(rgb(theme::MUTED))
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(size::TEXT_SMALL))
+                            .text_color(rgb(theme::MUTED))
+                            .child(when),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(entry) = this.recent_clusters.get(i) else {
+                            return;
+                        };
+                        this.open(entry.dir.clone(), None, cx);
+                    })),
+            );
+        }
+        card(theme::PANEL, theme::LINE)
+            .w(px(size::RECENT_WIDTH))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(card_title(theme::AMBER_PALE).child("Recent clusters"))
+                    .child(
+                        div()
+                            .text_size(px(size::TEXT_SMALL))
+                            .text_color(rgb(theme::MUTED))
+                            .child(count),
+                    ),
+            )
+            .child(filter)
+            .child(rows)
+    }
+
     /// The families of runs, the one changed last first, one row each
     /// however many forks they hold: how many failed, or else the base
     /// run's ending, its id and title, how many runs and how they ended,
@@ -2188,14 +2324,16 @@ impl Scrubber {
             .enumerate()
             .filter(|(_, f)| f.matches(&query))
             .collect();
-        let filter = div()
-            .p(px(size::NOTICE_PAD / 2.0))
-            .rounded(px(size::RADIUS_BUTTON))
-            .bg(rgb(theme::BG))
-            .border_1()
-            .border_color(rgb(theme::LINE_2))
-            .text_color(rgb(theme::TEXT))
-            .child(self.recent_filter.clone());
+        let filter = self.recent_clusters.is_empty().then(|| {
+            div()
+                .p(px(size::NOTICE_PAD / 2.0))
+                .rounded(px(size::RADIUS_BUTTON))
+                .bg(rgb(theme::BG))
+                .border_1()
+                .border_color(rgb(theme::LINE_2))
+                .text_color(rgb(theme::TEXT))
+                .child(self.recent_filter.clone())
+        });
         let count = match (shown.len(), self.recent.len()) {
             (n, all) if n == all => format!("{all} builds"),
             (n, all) => format!("{n} of {all} builds"),
@@ -2301,7 +2439,7 @@ impl Scrubber {
                             .child(count),
                     ),
             )
-            .child(filter)
+            .children(filter)
             .child(rows)
     }
 

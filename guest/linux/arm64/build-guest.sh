@@ -41,6 +41,20 @@ mkdir -p "$INITRD_ROOT"/{dev,proc,sys,tmp,build,etc,bin,nix,rewind/tools/bin}
 cp "$REPO_ROOT/target/aarch64-unknown-linux-musl/release/rewind-init" "$INITRD_ROOT/init"
 cp /bin/busybox "$INITRD_ROOT/rewind/tools/busybox"
 cp /bin/busybox "$INITRD_ROOT/bin/sh"
+for mke2fs in /sbin/mke2fs /usr/sbin/mke2fs /bin/mke2fs; do
+  if [ -x "$mke2fs" ]; then
+    cp "$mke2fs" "$INITRD_ROOT/rewind/tools/mke2fs"
+    # Bundle any shared libraries (and dynamic linker) required by mke2fs so it
+    # executes cleanly inside the standalone initramfs.
+    ldd "$mke2fs" 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i}' | sort -u | while read -r lib; do
+      if [ -e "$lib" ]; then
+        mkdir -p "$INITRD_ROOT$(dirname "$lib")"
+        cp -L "$lib" "$INITRD_ROOT$lib"
+      fi
+    done
+    break
+  fi
+done
 for applet in $(/bin/busybox --list); do
   ln -sf ../busybox "$INITRD_ROOT/rewind/tools/bin/$applet"
 done

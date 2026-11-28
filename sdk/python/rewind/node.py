@@ -77,6 +77,10 @@ class NodeHandle:
     async def restart(self) -> Dict[str, Any]:
         return await self._cluster.restart(self.name)
 
+    async def disk_stats(self) -> Optional[Dict[str, Any]]:
+        """Returns I/O and power-loss statistics for this node's virtual disk."""
+        return await self._cluster.disk_stats(self.name)
+
     async def clog(
         self,
         *,

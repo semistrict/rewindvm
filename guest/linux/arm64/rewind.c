@@ -9,6 +9,8 @@
  */
 
 #include <linux/binfmts.h>
+#include <linux/blk-mq.h>
+#include <linux/blkdev.h>
 #include <linux/clockchips.h>
 #include <linux/clocksource.h>
 #include <linux/sched_clock.h>
@@ -97,6 +99,7 @@ static inline void __iomem *rewind_io_base(void)
 #define REWIND_MMIO_IRQ_ACK	0x30
 #define REWIND_MMIO_SERIAL	0x38
 #define REWIND_MMIO_NET_TX	0x40
+#define REWIND_MMIO_BLK_REQ	0x48
 
 static inline void rewind_hvc_emit(u64 pa)
 {
@@ -147,6 +150,12 @@ static inline void rewind_hvc_serial(u8 ch)
 static inline void rewind_hvc_net_tx(u64 pa)
 {
 	writeq_relaxed(pa, rewind_io_base() + REWIND_MMIO_NET_TX);
+	isb();
+}
+
+static inline void rewind_hvc_blk_req(u64 pa)
+{
+	writeq_relaxed(pa, rewind_io_base() + REWIND_MMIO_BLK_REQ);
 	isb();
 }
 
@@ -271,6 +280,14 @@ struct rewind_shared {
 	u32 hid_prod;
 	u32 hid_cons;
 	struct rewind_hid_event hid_ring[REWIND_HID_SLOTS];
+	/*
+	 * Paravirtual crash-consistent block device (/dev/rwd0).
+	 * The monitor sets blk_enabled = 1 and blk_sectors during setup when a
+	 * persistent disk is attached.
+	 */
+	u32 blk_enabled;
+	u32 blk_pad;
+	u64 blk_sectors;
 };
 
 #define REWIND_PENDING_TIMER	BIT(0)
@@ -794,6 +811,169 @@ static int __init rewind_hid_init(void)
 
 	WRITE_ONCE(rewind_ptr_dev, ptr);
 	WRITE_ONCE(rewind_kbd_dev, kbd);
+	return 0;
+}
+
+/*
+ * Paravirtual crash-consistent block device (/dev/rwd0).
+ *
+ * Exposes a volatile write cache (BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA) backed
+ * synchronously by REWIND_MMIO_BLK_REQ. Normal writes land in the VMM's
+ * volatile sector cache and vanish on power loss (Cluster::crash); FLUSH and
+ * FUA writes commit sectors to durable storage that survives reboot.
+ */
+#define REWIND_BLK_OP_READ	0
+#define REWIND_BLK_OP_WRITE	1
+#define REWIND_BLK_OP_FLUSH	2
+#define REWIND_BLK_OP_WRITE_FUA	3
+
+struct rewind_blk_req {
+	u32 op;
+	u32 status;
+	u64 sector;
+	u64 buf_gpa;
+	u32 len;
+	u32 flags;
+};
+
+static DEFINE_SPINLOCK(rewind_blk_lock);
+static struct rewind_blk_req rewind_blk_cmd __aligned(64);
+static struct blk_mq_tag_set rewind_blk_tag_set;
+static struct gendisk *rewind_blk_disk;
+static int rewind_blk_major;
+
+static u32 rewind_blk_submit(u32 op, u64 sector, u64 buf_gpa, u32 len)
+{
+	unsigned long flags;
+	u32 status;
+
+	spin_lock_irqsave(&rewind_blk_lock, flags);
+	rewind_blk_cmd.op = op;
+	rewind_blk_cmd.status = 1;
+	rewind_blk_cmd.sector = sector;
+	rewind_blk_cmd.buf_gpa = buf_gpa;
+	rewind_blk_cmd.len = len;
+	rewind_blk_cmd.flags = 0;
+	wmb();
+	rewind_hvc_blk_req(virt_to_phys(&rewind_blk_cmd));
+	rmb();
+	status = READ_ONCE(rewind_blk_cmd.status);
+	spin_unlock_irqrestore(&rewind_blk_lock, flags);
+	return status;
+}
+
+static blk_status_t rewind_blk_queue_rq(struct blk_mq_hw_ctx *hctx,
+					const struct blk_mq_queue_data *bd)
+{
+	struct request *rq = bd->rq;
+	enum req_op op = req_op(rq);
+	u32 status = 0;
+
+	blk_mq_start_request(rq);
+
+	if (op == REQ_OP_FLUSH) {
+		status = rewind_blk_submit(REWIND_BLK_OP_FLUSH, 0, 0, 0);
+	} else if (op == REQ_OP_READ || op == REQ_OP_WRITE) {
+		u64 sector = blk_rq_pos(rq);
+		bool is_write = (op == REQ_OP_WRITE);
+		bool is_fua = is_write && (rq->cmd_flags & REQ_FUA);
+		struct req_iterator iter;
+		struct bio_vec bvec;
+
+		if (is_write && (rq->cmd_flags & REQ_PREFLUSH))
+			status = rewind_blk_submit(REWIND_BLK_OP_FLUSH, 0, 0, 0);
+
+		if (!status) {
+			u32 req_code = is_fua ? REWIND_BLK_OP_WRITE_FUA :
+				       (is_write ? REWIND_BLK_OP_WRITE :
+						   REWIND_BLK_OP_READ);
+			rq_for_each_segment(bvec, rq, iter) {
+				u64 gpa = page_to_phys(bvec.bv_page) +
+					  bvec.bv_offset;
+
+				status = rewind_blk_submit(req_code, sector,
+							   gpa, bvec.bv_len);
+				if (status)
+					break;
+				sector += bvec.bv_len >> 9;
+			}
+		}
+	} else {
+		status = 1;
+	}
+
+	blk_mq_end_request(rq, status ? BLK_STS_IOERR : BLK_STS_OK);
+	return BLK_STS_OK;
+}
+
+static const struct blk_mq_ops rewind_blk_mq_ops = {
+	.queue_rq = rewind_blk_queue_rq,
+};
+
+static const struct block_device_operations rewind_blk_fops = {
+	.owner = THIS_MODULE,
+};
+
+static int __init rewind_blk_init(void)
+{
+	struct queue_limits lim = {
+		.logical_block_size	= 512,
+		.physical_block_size	= 4096,
+		.max_hw_sectors		= 256,
+		.features		= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA,
+	};
+	struct gendisk *disk;
+	u64 sectors;
+	int err;
+
+	BUILD_BUG_ON(offsetof(struct rewind_shared, blk_enabled) != 3616);
+	BUILD_BUG_ON(offsetof(struct rewind_shared, blk_sectors) != 3624);
+	BUILD_BUG_ON(sizeof(struct rewind_blk_req) != 32);
+
+	sectors = READ_ONCE(rewind_shared.blk_sectors);
+	if (!sectors)
+		return 0;
+
+	rewind_blk_major = register_blkdev(0, "rwd");
+	if (rewind_blk_major < 0)
+		return rewind_blk_major;
+
+	memset(&rewind_blk_tag_set, 0, sizeof(rewind_blk_tag_set));
+	rewind_blk_tag_set.ops = &rewind_blk_mq_ops;
+	rewind_blk_tag_set.nr_hw_queues = 1;
+	rewind_blk_tag_set.queue_depth = 16;
+	rewind_blk_tag_set.numa_node = NUMA_NO_NODE;
+	err = blk_mq_alloc_tag_set(&rewind_blk_tag_set);
+	if (err) {
+		unregister_blkdev(rewind_blk_major, "rwd");
+		return err;
+	}
+
+	disk = blk_mq_alloc_disk(&rewind_blk_tag_set, &lim, NULL);
+	if (IS_ERR(disk)) {
+		err = PTR_ERR(disk);
+		blk_mq_free_tag_set(&rewind_blk_tag_set);
+		unregister_blkdev(rewind_blk_major, "rwd");
+		return err;
+	}
+
+	disk->major = rewind_blk_major;
+	disk->first_minor = 0;
+	disk->minors = 1;
+	disk->flags |= GENHD_FL_NO_PART;
+	disk->fops = &rewind_blk_fops;
+	strscpy(disk->disk_name, "rwd0", sizeof(disk->disk_name));
+	set_capacity(disk, sectors);
+
+	err = add_disk(disk);
+	if (err) {
+		put_disk(disk);
+		blk_mq_free_tag_set(&rewind_blk_tag_set);
+		unregister_blkdev(rewind_blk_major, "rwd");
+		return err;
+	}
+
+	rewind_blk_disk = disk;
 	return 0;
 }
 
@@ -1668,6 +1848,12 @@ static int __init rewind_events_init(void)
 
 	if (READ_ONCE(rewind_shared.fb_enabled)) {
 		err = rewind_hid_init();
+		if (err)
+			return err;
+	}
+
+	if (READ_ONCE(rewind_shared.blk_enabled)) {
+		err = rewind_blk_init();
 		if (err)
 			return err;
 	}

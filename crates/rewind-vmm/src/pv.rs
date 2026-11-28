@@ -2,6 +2,8 @@
 //! arch/x86/kernel/cpu/rewind.c in guest/linux/rewind-guest.patch, and the
 //! two must agree on every constant here.
 
+/// outl: guest physical address of a `rewind_blk_req` block I/O request.
+pub const PORT_BLK_REQ: u16 = 0x5dc;
 /// outl: guest physical address of a record.
 pub const PORT_EMIT: u16 = 0x5e0;
 /// inl: write the virtual clock into the shared page.
@@ -262,6 +264,31 @@ const _: () = assert!(SHARED_HID_RING == 3360 && SHARED_HID_RING.is_multiple_of(
 const _: () = assert!(
     SHARED_HID_RING + (HID_SLOTS as u64) * HID_EVENT_SIZE <= crate::layout::PAGE_SIZE as u64
 );
+
+/// Paravirtual crash-consistent block device (`/dev/rwd0`):
+/// - The monitor sets `blk_enabled = 1` and `blk_sectors` during `PORT_SETUP`
+///   when the node has a persistent virtual disk attached.
+/// - The guest submits synchronous sector reads, volatile writes, flushes, and
+///   FUA writes by writing the GPA of a 32-byte `rewind_blk_req` struct to
+///   `PORT_BLK_REQ` (`MMIO_BLK_REQ`).
+pub const SHARED_BLK_ENABLED: u64 = SHARED_HID_RING + (HID_SLOTS as u64) * HID_EVENT_SIZE;
+pub const SHARED_BLK_SECTORS: u64 = SHARED_BLK_ENABLED + 8;
+
+pub const BLK_OP_READ: u32 = 0;
+pub const BLK_OP_WRITE: u32 = 1;
+pub const BLK_OP_FLUSH: u32 = 2;
+pub const BLK_OP_WRITE_FUA: u32 = 3;
+
+pub const BLK_STATUS_OK: u32 = 0;
+pub const BLK_STATUS_IOERR: u32 = 1;
+/// Size of `struct rewind_blk_req` in bytes.
+pub const BLK_REQ_SIZE: usize = 32;
+/// Maximum single block I/O transfer length accepted from a guest (1 MiB).
+pub const BLK_IO_MAX: usize = 1024 * 1024;
+
+const _: () = assert!(SHARED_BLK_ENABLED == 3616);
+const _: () = assert!(SHARED_BLK_SECTORS == 3624 && SHARED_BLK_SECTORS.is_multiple_of(8));
+const _: () = assert!(SHARED_BLK_SECTORS + 8 <= crate::layout::PAGE_SIZE as u64);
 
 /// Whether a guest kernel that names interface `version` is one this
 /// monitor runs: its own, and no other.

@@ -129,6 +129,9 @@ pub const UI_FONTS: &[&str] = &[
     "DejaVu Sans",
     "Liberation Sans",
     "Cantarell",
+    "Helvetica Neue",
+    "Helvetica",
+    "Arial",
 ];
 pub const MONO_FONTS: &[&str] = &[
     "JetBrains Mono",
@@ -136,6 +139,10 @@ pub const MONO_FONTS: &[&str] = &[
     "Noto Sans Mono",
     "DejaVu Sans Mono",
     "Liberation Mono",
+    "SF Mono",
+    "Menlo",
+    "Monaco",
+    "Courier New",
 ];
 
 /// Sizes in pixels, from the design's 1440 by 900 layout.

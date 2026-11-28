@@ -136,6 +136,7 @@ impl SpecExt for Spec {
             extras: self.extras,
             net: None,
             fb: None,
+            disk_mib: None,
         })
     }
 }
@@ -3028,6 +3029,7 @@ pub(crate) mod tests {
                 output: rewind_init::Output::Plain,
                 sandbox: rewind_init::Sandbox::Shared,
                 net: None,
+                disk_mount: None,
             },
         }
     }
