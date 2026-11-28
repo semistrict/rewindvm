@@ -1151,6 +1151,17 @@ impl ClusterRun {
 
         let mut cluster = self.open_cluster_at(home, from_ns)?;
         let mut noop = NoopObserver;
+        let mut hid_overlay = if opts.input_overlay {
+            let network: NetSwitchConfig =
+                serde_json::from_value(self.manifest.network_json.clone())
+                    .context("decoding cluster network configuration for HID overlay")?;
+            Some(crate::video_overlay::HidOverlay::from_faults(
+                &network.faults,
+                node_idx,
+            ))
+        } else {
+            None
+        };
 
         if let Some(parent) = out_path.parent()
             && !parent.as_os_str().is_empty()
@@ -1231,8 +1242,11 @@ impl ClusterRun {
                 scratch.resize(needed, 0);
             }
 
+            if let Some(overlay) = hid_overlay.as_mut() {
+                overlay.draw(&mut scratch, sink_w, sink_h, target_ns);
+            }
             if opts.timestamp_overlay {
-                draw_timestamp_hud(&mut scratch, sink_w, sink_h, target_ns);
+                crate::video_overlay::draw_timestamp_hud(&mut scratch, sink_w, sink_h, target_ns);
             }
 
             if let Some(f) = raw_file.as_mut() {
@@ -2127,8 +2141,10 @@ pub struct VideoExportOptions {
     pub fps: u32,
     pub from_ms: Option<u64>,
     pub to_ms: Option<u64>,
-    /// Burn the virtual timestamp (`t = 00:04.233`) into the top-right corner.
+    /// Burn the virtual timestamp (`VT mm:ss.mmm`) into the top-right corner.
     pub timestamp_overlay: bool,
+    /// Render recorded paravirtual mouse cursor, click ripples, and keypresses.
+    pub input_overlay: bool,
 }
 
 impl Default for VideoExportOptions {
@@ -2138,6 +2154,7 @@ impl Default for VideoExportOptions {
             from_ms: None,
             to_ms: None,
             timestamp_overlay: false,
+            input_overlay: false,
         }
     }
 }
@@ -2289,93 +2306,6 @@ impl FfmpegPipe {
             );
         }
         Ok(())
-    }
-}
-
-/// Tiny 5×7 bitmap glyph table for zero-dependency virtual-time HUD stamps.
-fn hud_glyph(ch: u8) -> [u8; 7] {
-    match ch {
-        b'0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-        b'1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        b'2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
-        b'3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
-        b'4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-        b'5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-        b'6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-        b'7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-        b'8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-        b'9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-        b':' => [0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00],
-        b'.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
-        b't' => [0x04, 0x04, 0x1F, 0x04, 0x04, 0x05, 0x02],
-        b's' => [0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E, 0x00],
-        b'=' => [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00],
-        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
-        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-        _ => [0; 7],
-    }
-}
-
-/// Stamps a crisp translucent virtual-time badge (`VT 00:04.233`) in the
-/// top-right corner of a packed `bgr0` frame.
-fn draw_timestamp_hud(buf: &mut [u8], width: u32, height: u32, ns: u64) {
-    let total_ms = ns / 1_000_000;
-    let mins = (total_ms / 60_000) % 100;
-    let secs = (total_ms / 1_000) % 60;
-    let ms = total_ms % 1_000;
-    let label = format!("VT {mins:02}:{secs:02}.{ms:03}");
-
-    let scale = 2usize;
-    let char_w = 6 * scale;
-    let char_h = 7 * scale;
-    let pad_x = 10usize;
-    let pad_y = 6usize;
-    let box_w = label.len() * char_w + pad_x * 2 - scale;
-    let box_h = char_h + pad_y * 2;
-    let margin = 12usize;
-    let w = width as usize;
-    let h = height as usize;
-    if w < box_w + margin * 2 || h < box_h + margin * 2 {
-        return;
-    }
-    let x0 = w - box_w - margin;
-    let y0 = margin;
-
-    // Dark translucent pill (75% black blend).
-    for y in y0..(y0 + box_h) {
-        for x in x0..(x0 + box_w) {
-            let off = (y * w + x) * 4;
-            if off + 4 <= buf.len() {
-                buf[off] /= 4;
-                buf[off + 1] /= 4;
-                buf[off + 2] /= 4;
-            }
-        }
-    }
-    // Crisp bright cyan-white text (`R=240, G=248, B=255`).
-    for (ci, ch) in label.bytes().enumerate() {
-        let glyph = hud_glyph(ch);
-        let gx = x0 + pad_x + ci * char_w;
-        let gy = y0 + pad_y;
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..5usize {
-                if (bits & (1 << (4 - col))) != 0 {
-                    for sy in 0..scale {
-                        for sx in 0..scale {
-                            let px = gx + col * scale + sx;
-                            let py = gy + row * scale + sy;
-                            let off = (py * w + px) * 4;
-                            if off + 4 <= buf.len() {
-                                buf[off] = 255;     // B
-                                buf[off + 1] = 248; // G
-                                buf[off + 2] = 240; // R
-                                buf[off + 3] = 0;
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -2620,8 +2550,8 @@ mod pcap_tests {
 
         let mut hud_a = dst.clone();
         let mut hud_b = dst.clone();
-        draw_timestamp_hud(&mut hud_a, 300, 64, 4_233_000_000);
-        draw_timestamp_hud(&mut hud_b, 300, 64, 4_233_000_000);
+        crate::video_overlay::draw_timestamp_hud(&mut hud_a, 300, 64, 4_233_000_000);
+        crate::video_overlay::draw_timestamp_hud(&mut hud_b, 300, 64, 4_233_000_000);
         assert_eq!(hud_a, hud_b);
         assert_ne!(hud_a, dst);
         // Top-left pixel (far from top-right HUD badge) stays untouched.

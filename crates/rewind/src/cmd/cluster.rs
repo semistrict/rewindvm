@@ -278,6 +278,9 @@ pub(crate) struct ClusterVideoArgs {
     /// Burn the virtual timestamp (`VT mm:ss.mmm`) into the top-right corner.
     #[arg(long)]
     pub(crate) timestamp: bool,
+    /// Render recorded paravirtual cursor, click ripples, and keypresses onto the video.
+    #[arg(long = "show-input", alias = "input-overlay")]
+    pub(crate) show_input: bool,
 }
 
 #[derive(clap::Args)]
@@ -969,6 +972,7 @@ fn cmd_video(home: &Home, args: ClusterVideoArgs) -> Result<ExitCode> {
         from_ms: args.from_ms,
         to_ms: args.to_ms,
         timestamp_overlay: args.timestamp,
+        input_overlay: args.show_input,
     };
     let stats = run.export_video(home, &args.node, &args.output, &opts)?;
     eprintln!(

@@ -36,7 +36,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::net::{
-    DropReason, FaultAction, FaultKind, InFlightFrame, NetEvent, NetStats, NetSwitch,
+    DropReason, FaultAction, FaultKind, HidEvent, InFlightFrame, NetEvent, NetStats, NetSwitch,
     NetSwitchConfig, NetSwitchState,
 };
 use crate::snapshot::{Keyframe, Pages, PreparedKeyframe, finish_keyframe};
@@ -536,6 +536,9 @@ enum WorkerReq {
     SendInput {
         data: Vec<u8>,
     },
+    SendHid {
+        events: Vec<HidEvent>,
+    },
     ReadFramebuffer,
     KeyframeDirect {
         parent: Option<u64>,
@@ -782,6 +785,15 @@ fn worker_loop(
                 };
                 WorkerResp::Meta(res)
             }
+            WorkerReq::SendHid { events } => {
+                let res = match machine.as_mut() {
+                    Some(m) => m
+                        .send_hid_events(&events)
+                        .map(|()| NodeMeta::from_machine(m)),
+                    None => Err(anyhow!("worker has no live Machine for SendHid")),
+                };
+                WorkerResp::Meta(res)
+            }
             WorkerReq::ReadFramebuffer => {
                 let res = match machine.as_ref() {
                     Some(m) => m.read_framebuffer(),
@@ -920,6 +932,9 @@ mod proc_worker {
         },
         SendInput {
             data: Vec<u8>,
+        },
+        SendHid {
+            events: Vec<HidEvent>,
         },
         ReadFramebuffer,
         KeyframeDirect {
@@ -1124,6 +1139,7 @@ mod proc_worker {
                     WireReq::AdvanceIdleTo { target_local }
                 }
                 WorkerReq::SendInput { data } => WireReq::SendInput { data },
+                WorkerReq::SendHid { events } => WireReq::SendHid { events },
                 WorkerReq::ReadFramebuffer => WireReq::ReadFramebuffer,
                 WorkerReq::KeyframeDirect { parent, store_path } => {
                     WireReq::KeyframeDirect { parent, store_path }
@@ -1347,6 +1363,15 @@ mod proc_worker {
                             .send_console_input(&data)
                             .map(|()| NodeMeta::from_machine(m)),
                         None => Err(anyhow!("worker has no live Machine for SendInput")),
+                    };
+                    WireResp::Meta(res.map_err(|e| format!("{e:#}")))
+                }
+                WireReq::SendHid { events } => {
+                    let res = match machine.as_mut() {
+                        Some(m) => m
+                            .send_hid_events(&events)
+                            .map(|()| NodeMeta::from_machine(m)),
+                        None => Err(anyhow!("worker has no live Machine for SendHid")),
                     };
                     WireResp::Meta(res.map_err(|e| format!("{e:#}")))
                 }
@@ -1627,6 +1652,34 @@ impl LiveNode {
                     }
                     _ => bail!(
                         "unexpected response to SendInput from node {}",
+                        self.cfg.name
+                    ),
+                }
+            }
+        }
+    }
+
+    fn send_hid(&mut self, events: Vec<HidEvent>) -> Result<()> {
+        match &mut self.backend {
+            NodeBackend::Local(opt) => {
+                if let Some(m) = opt.as_mut() {
+                    m.send_hid_events(&events)?;
+                    self.meta = Some(NodeMeta::from_machine(m));
+                }
+                Ok(())
+            }
+            NodeBackend::Worker(w) => {
+                if self.meta.is_none() {
+                    return Ok(());
+                }
+                w.send(WorkerReq::SendHid { events })?;
+                match w.recv()? {
+                    WorkerResp::Meta(res) => {
+                        self.meta = Some(res?);
+                        Ok(())
+                    }
+                    _ => bail!(
+                        "unexpected response to SendHid from node {}",
                         self.cfg.name
                     ),
                 }
@@ -3431,6 +3484,15 @@ impl Cluster {
                         self.advance_idle_node_to(idx, wake_ns)?;
                     }
                     self.nodes[idx].send_input(data)?;
+                }
+            }
+            FaultAction::HidEvents(idx, events) => {
+                if idx < self.nodes.len() {
+                    if self.nodes[idx].is_alive() && !self.nodes[idx].is_runnable() {
+                        let wake_ns = at_ns.max(self.cluster_ns);
+                        self.advance_idle_node_to(idx, wake_ns)?;
+                    }
+                    self.nodes[idx].send_hid(events)?;
                 }
             }
             FaultAction::Restart(idx) => {

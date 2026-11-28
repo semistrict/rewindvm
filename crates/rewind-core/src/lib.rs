@@ -38,6 +38,7 @@ pub mod source_lists;
 pub mod state;
 pub mod threads;
 pub mod tree;
+pub(crate) mod video_overlay;
 
 pub use home::{Guest, Home};
 

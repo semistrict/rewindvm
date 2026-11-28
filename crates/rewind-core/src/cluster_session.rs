@@ -30,7 +30,9 @@ use rewind_vmm::DirtyLog;
 use rewind_vmm::cluster::{
     Cluster, ClusterKeyframe, ClusterObserver, ClusterStop, NodeEncoders,
 };
-use rewind_vmm::net::{FaultKind, NetEvent, NetLogWriter, NetStats, NetSwitchConfig, ScheduledFault};
+use rewind_vmm::net::{
+    FaultKind, HidEvent, NetEvent, NetLogWriter, NetStats, NetSwitchConfig, ScheduledFault,
+};
 
 use crate::cluster::{
     CLUSTER_KEYFRAME_INTERVAL_NS, ClusterRun, ClusterRunOptions, PreparedCluster,
@@ -965,6 +967,14 @@ impl ClusterSession {
     pub fn send_input(&mut self, node: &str, data: Vec<u8>) -> Result<()> {
         let idx = self.node_index(node)?;
         self.apply_interactive_fault(FaultKind::SendInput { node: idx, data })
+    }
+
+    /// Injects deterministic Linux `evdev` pointer/keyboard events into `node`'s
+    /// paravirtual HID devices (`/dev/input/event0` and `/dev/input/event1`),
+    /// recorded in the cluster trace for bit-for-bit replay.
+    pub fn send_hid(&mut self, node: &str, events: Vec<HidEvent>) -> Result<()> {
+        let idx = self.node_index(node)?;
+        self.apply_interactive_fault(FaultKind::HidEvents { node: idx, events })
     }
 
     /// Reads captured lines for `node` on `stream` starting at `since`.

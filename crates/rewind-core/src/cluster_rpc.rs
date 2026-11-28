@@ -515,6 +515,22 @@ fn dispatch(
                 "cluster_step": st.cluster_step,
             }))
         }
+        "cluster.send_hid" => {
+            #[derive(Deserialize)]
+            struct P {
+                node: String,
+                events: Vec<rewind_vmm::net::HidEvent>,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.send_hid")?;
+            let s = require_session(session)?;
+            s.send_hid(&p.node, p.events)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+            }))
+        }
         "cluster.logs" => {
             #[derive(Deserialize)]
             struct P {

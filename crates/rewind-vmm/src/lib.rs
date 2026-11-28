@@ -1042,6 +1042,25 @@ impl Machine {
         self.dev.read_framebuffer()
     }
 
+    /// Injects deterministic Linux `evdev` HID events into the guest's
+    /// `rewind_shared.hid_ring` and signals `PENDING_HID`.
+    pub fn send_hid_events(&mut self, events: &[net::HidEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let shared = self.dev.push_hid_events(events)?;
+        if self.dirty_log == DirtyLog::On
+            && let Some(off) = shared.checked_sub(RAM_BASE)
+        {
+            let page = (off as usize) / PAGE_SIZE;
+            self.dev.monitor_dirty_pages.push(page);
+            self.checkpoints.since.insert(page as u32);
+        }
+        let _ = self.inject(pv::PENDING_HID)?;
+        self.dev.idle = false;
+        Ok(())
+    }
+
     /// Immediately injects `data` into the guest's `/dev/rewind-console`
     /// buffer and wakes the node if it is idle (used by interactive clusters
     /// to dispatch deterministic commands into a running or restored guest).
@@ -1663,6 +1682,46 @@ impl Machine {
 }
 
 impl Devices {
+    /// Pushes Linux `evdev` events into `rewind_shared.hid_ring` and returns
+    /// the shared page's GPA so the caller can mark it dirty and raise `PENDING_HID`.
+    pub(crate) fn push_hid_events(&mut self, events: &[net::HidEvent]) -> Result<u64> {
+        let shared = self
+            .shared
+            .context("the VM has not finished booting; cannot send HID events")?;
+        if events.len() > pv::HID_SLOTS as usize {
+            bail!(
+                "HID batch of {} events exceeds ring capacity of {}",
+                events.len(),
+                pv::HID_SLOTS
+            );
+        }
+        let mut prod_b = [0u8; 4];
+        let mut cons_b = [0u8; 4];
+        self.ram_read(shared + pv::SHARED_HID_PROD, &mut prod_b)?;
+        self.ram_read(shared + pv::SHARED_HID_CONS, &mut cons_b)?;
+        let mut prod = u32::from_le_bytes(prod_b);
+        let cons = u32::from_le_bytes(cons_b);
+        let used = prod.wrapping_sub(cons);
+        if used.saturating_add(events.len() as u32) > pv::HID_SLOTS {
+            bail!(
+                "guest HID ring is full ({used}/{} used, trying to push {})",
+                pv::HID_SLOTS,
+                events.len()
+            );
+        }
+        for ev in events {
+            let slot = (prod % pv::HID_SLOTS) as u64;
+            let mut raw = [0u8; 8];
+            raw[0..2].copy_from_slice(&ev.kind.to_le_bytes());
+            raw[2..4].copy_from_slice(&ev.code.to_le_bytes());
+            raw[4..8].copy_from_slice(&ev.value.to_le_bytes());
+            self.ram_write(shared + pv::SHARED_HID_RING + slot * pv::HID_EVENT_SIZE, &raw)?;
+            prod = prod.wrapping_add(1);
+        }
+        self.ram_write(shared + pv::SHARED_HID_PROD, &prod.to_le_bytes())?;
+        Ok(shared)
+    }
+
     /// Reads the current paravirtual framebuffer (`XRGB8888`, `bgr0` byte order)
     /// directly from reserved guest RAM, returning `Ok(None)` if display is
     /// disabled on this VM.
@@ -2074,6 +2133,71 @@ mod tests {
         });
         assert_eq!(allocations, 0);
         assert!(kept.0.is_empty());
+    }
+
+    #[test]
+    fn push_hid_events_wraps_ring_and_rejects_overflow() {
+        let mut dev = devices(0);
+        let shared = dev.shared.expect("test devices have a shared page");
+
+        // Advance prod/cons near the end of the 32-slot ring so our push wraps around slot 0.
+        let start = pv::HID_SLOTS - 2;
+        dev.ram_write(shared + pv::SHARED_HID_PROD, &start.to_le_bytes())
+            .unwrap();
+        dev.ram_write(shared + pv::SHARED_HID_CONS, &start.to_le_bytes())
+            .unwrap();
+
+        let batch = [
+            net::HidEvent {
+                kind: 3,
+                code: 0,
+                value: 16384,
+            },
+            net::HidEvent {
+                kind: 3,
+                code: 1,
+                value: 8192,
+            },
+            net::HidEvent {
+                kind: 1,
+                code: 0x110,
+                value: 1,
+            },
+            net::HidEvent {
+                kind: 0,
+                code: 0,
+                value: 0,
+            },
+        ];
+        assert_eq!(dev.push_hid_events(&batch).unwrap(), shared);
+
+        let mut prod_b = [0u8; 4];
+        dev.ram_read(shared + pv::SHARED_HID_PROD, &mut prod_b)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(prod_b), start + 4);
+
+        // Verify wrapped slots (30, 31, 0, 1) match the pushed events byte-for-byte.
+        for (i, ev) in batch.iter().enumerate() {
+            let slot = ((start + i as u32) % pv::HID_SLOTS) as u64;
+            let mut raw = [0u8; 8];
+            dev.ram_read(shared + pv::SHARED_HID_RING + slot * pv::HID_EVENT_SIZE, &mut raw)
+                .unwrap();
+            assert_eq!(u16::from_le_bytes([raw[0], raw[1]]), ev.kind);
+            assert_eq!(u16::from_le_bytes([raw[2], raw[3]]), ev.code);
+            assert_eq!(i32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]), ev.value);
+        }
+
+        // Pushing 29 more events when 4/32 are already unread must fail cleanly.
+        let overflow = vec![
+            net::HidEvent {
+                kind: 0,
+                code: 0,
+                value: 0,
+            };
+            (pv::HID_SLOTS - 3) as usize
+        ];
+        let err = dev.push_hid_events(&overflow).unwrap_err();
+        assert!(err.to_string().contains("HID ring is full"), "{err:#}");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
