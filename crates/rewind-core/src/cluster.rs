@@ -542,6 +542,35 @@ pub fn prepare_cluster(
         None
     };
 
+    let mut control_nodes: Vec<rewind_vmm::control::ControlNodeMeta> =
+        Vec::with_capacity(spec_file.nodes.len());
+    for (idx, n) in spec_file.nodes.iter().enumerate() {
+        control_nodes.push(rewind_vmm::control::ControlNodeMeta {
+            name: n.name.clone(),
+            ip: resolved_ips[idx].clone(),
+        });
+    }
+    // Reserve the last usable host IP in the subnet (e.g. 10.0.0.254 for /24)
+    // for the switch-resident `http://rewind` coordinator endpoint unless a
+    // user explicitly assigned that exact IP to a node.
+    let host_mask: u32 = if prefix_len == 0 {
+        u32::MAX
+    } else {
+        !0u32 >> prefix_len
+    };
+    let network_u32 = base_ip_u32 & !host_mask;
+    let candidate_ctrl_ip = Ipv4Addr::from((network_u32 | host_mask).saturating_sub(1));
+    let candidate_ctrl_str = candidate_ctrl_ip.to_string();
+    let control_ip = if !resolved_ips.iter().any(|ip| ip == &candidate_ctrl_str) {
+        hosts.push((
+            candidate_ctrl_str,
+            rewind_vmm::control::CONTROL_HOST.to_string(),
+        ));
+        Some(candidate_ctrl_ip.octets())
+    } else {
+        None
+    };
+
     let switch_seed = mix64(opts.seed ^ opts.schedule.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let net_config = NetSwitchConfig {
         node_count: spec_file.nodes.len(),
@@ -554,6 +583,8 @@ pub fn prepare_cluster(
         links,
         faults,
         nemesis,
+        control_ip,
+        control_nodes,
     };
 
     // 3. Build each node's Spec + Config.

@@ -371,6 +371,117 @@ fn dispatch(
                 wall,
             )?)?)
         }
+        "cluster.wait_any" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                nodes: Vec<String>,
+                contains: String,
+                stream: Option<String>,
+                timeout_ms: Option<u64>,
+                #[serde(default)]
+                from_start: bool,
+                wall_timeout_ms: Option<u64>,
+            }
+            let p: P =
+                serde_json::from_value(params).context("invalid params for cluster.wait_any")?;
+            let stream = match p.stream.as_deref() {
+                Some(st) => LogStream::parse(st)?,
+                None => LogStream::Output,
+            };
+            let timeout_ns = p.timeout_ms.map(|m| m.saturating_mul(1_000_000));
+            let wall = p.wall_timeout_ms.map(Duration::from_millis);
+            let s = require_session(session)?;
+            Ok(serde_json::to_value(s.wait_any(
+                &p.nodes,
+                &p.contains,
+                stream,
+                timeout_ns,
+                p.from_start,
+                wall,
+            )?)?)
+        }
+        "cluster.wait_signal" => {
+            #[derive(Deserialize, Default)]
+            struct P {
+                name: Option<String>,
+                names: Option<Vec<String>>,
+                node: Option<String>,
+                nodes: Option<Vec<String>>,
+                barrier: Option<bool>,
+                timeout_ms: Option<u64>,
+                #[serde(default)]
+                from_start: bool,
+                wall_timeout_ms: Option<u64>,
+            }
+            let p: P = serde_json::from_value(params)
+                .context("invalid params for cluster.wait_signal")?;
+            let names: Option<Vec<String>> = match (p.names, p.name) {
+                (Some(v), _) => Some(v),
+                (None, Some(n)) => Some(vec![n]),
+                (None, None) => None,
+            };
+            let nodes: Option<Vec<String>> = match (p.nodes, p.node) {
+                (Some(v), _) => Some(v),
+                (None, Some(n)) => Some(vec![n]),
+                (None, None) => None,
+            };
+            let timeout_ns = p.timeout_ms.map(|m| m.saturating_mul(1_000_000));
+            let wall = p.wall_timeout_ms.map(Duration::from_millis);
+            let s = require_session(session)?;
+            Ok(serde_json::to_value(s.wait_signal(
+                names.as_deref(),
+                nodes.as_deref(),
+                p.barrier,
+                timeout_ns,
+                p.from_start,
+                wall,
+            )?)?)
+        }
+        "cluster.release" => {
+            use base64::Engine;
+            #[derive(Deserialize)]
+            struct P {
+                name: String,
+                node: Option<String>,
+                status: Option<u16>,
+                body: Option<String>,
+                body_base64: Option<String>,
+            }
+            let p: P =
+                serde_json::from_value(params).context("invalid params for cluster.release")?;
+            let body = match (p.body, p.body_base64) {
+                (Some(s), None) => s.into_bytes(),
+                (None, Some(b64)) => base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .context("invalid base64 in cluster.release.body_base64")?,
+                (None, None) => Vec::new(),
+                (Some(_), Some(_)) => {
+                    bail!("cluster.release accepts at most one of `body` or `body_base64`")
+                }
+            };
+            let status = p.status.unwrap_or(200);
+            let s = require_session(session)?;
+            let released = s.release_barrier(&p.name, p.node.as_deref(), status, body)?;
+            let st = s.status();
+            Ok(json!({
+                "cluster_ns": st.cluster_ns,
+                "cluster_step": st.cluster_step,
+                "released": released,
+            }))
+        }
+        "cluster.signals" => {
+            #[derive(Deserialize, Default)]
+            struct P {
+                #[serde(default)]
+                since: u64,
+            }
+            let p: P = serde_json::from_value(params).unwrap_or_default();
+            let s = require_session(session)?;
+            Ok(json!({
+                "signals": s.signals(p.since),
+            }))
+        }
         "cluster.wait_exit" => {
             #[derive(Deserialize, Default)]
             struct P {

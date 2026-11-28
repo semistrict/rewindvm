@@ -167,6 +167,8 @@ pub trait ClusterObserver {
     /// Raw Ethernet frame transmitted by `src` at cluster virtual time `ns`
     /// (used for on-demand `.pcap` export during replay).
     fn net_tx_frame(&mut self, _ns: u64, _src: usize, _frame: &[u8]) {}
+    /// Guest signal or barrier arrival sent to the virtual `http://rewind` endpoint.
+    fn control_signal(&mut self, _signal: &crate::control::ControlSignal) {}
     /// Return true to pause the cluster loop at the end of the current round.
     fn stop(&self) -> bool {
         false
@@ -3195,7 +3197,10 @@ impl Cluster {
             all_tx.sort_by_key(|&(tx_cns, src, seq, _)| (tx_cns, src, seq));
             for (tx_cns, src, _seq, frame) in all_tx {
                 obs.net_tx_frame(tx_cns, src, &frame);
-                self.switch.on_tx(tx_cns, src, frame, &mut net_events);
+                let signals = self.switch.on_tx(tx_cns, src, frame, &mut net_events);
+                for sig in &signals {
+                    obs.control_signal(sig);
+                }
             }
             self.flush_net_events(&mut net_events, obs);
 
@@ -3406,12 +3411,28 @@ impl Cluster {
         let next_rx: Vec<Option<u64>> = (0..self.nodes.len())
             .map(|i| self.switch.next_delivery_for(i))
             .collect();
-        compute_lookahead_from(
+        let (earliest_tx, mut incoming_bound) = compute_lookahead_from(
             &states,
             &next_rx,
             |a, b| self.switch.is_blocked(a, b),
             |a, b| self.switch.link_min_latency_ns(a, b),
-        )
+        );
+        if self.switch.control_enabled() {
+            let cl = self.switch.control_latency_ns();
+            for (i, bound) in incoming_bound.iter_mut().enumerate() {
+                let et = earliest_tx[i];
+                if et != u64::MAX {
+                    *bound = (*bound).min(et.saturating_add(cl));
+                }
+            }
+        }
+        (earliest_tx, incoming_bound)
+    }
+
+    /// Number of waiting barrier connections released by the most recent
+    /// [`FaultKind::ControlRelease`].
+    pub fn last_control_released(&self) -> usize {
+        self.switch.last_control_released()
     }
 
     fn advance_cluster_ns_after_round(&mut self) {

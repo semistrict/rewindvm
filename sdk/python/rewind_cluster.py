@@ -60,6 +60,8 @@ __all__ = [
     "ClusterError",
     "NodeHandle",
     "Nemesis",
+    "SignalEvent",
+    "WaitAnyResult",
     "WaitResult",
 ]
 
@@ -145,6 +147,52 @@ class WaitResult:
         return self.cluster_ns / 1_000_000.0
 
 
+@dataclass
+class WaitAnyResult:
+    matched: bool
+    node: Optional[str]
+    line: Optional[str]
+    cluster_ns: int
+    cluster_step: int
+    node_step: int
+
+    @property
+    def cluster_ms(self) -> float:
+        return self.cluster_ns / 1_000_000.0
+
+
+@dataclass
+class SignalEvent:
+    """One signal or barrier arrival sent by a guest to ``http://rewind``."""
+
+    seq: int
+    ns: int
+    node: str
+    name: str
+    payload: str
+    barrier: bool
+    conn_id: Optional[int] = None
+
+    @property
+    def ms(self) -> float:
+        return self.ns / 1_000_000.0
+
+    def json(self) -> Any:
+        return json.loads(self.payload)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "SignalEvent":
+        return cls(
+            seq=int(d["seq"]),
+            ns=int(d["ns"]),
+            node=str(d["node"]),
+            name=str(d["name"]),
+            payload=str(d.get("payload", "")),
+            barrier=bool(d.get("barrier", False)),
+            conn_id=int(d["conn_id"]) if d.get("conn_id") is not None else None,
+        )
+
+
 class NodeHandle:
     """Async convenience handle for one node in a :class:`Cluster`."""
 
@@ -180,6 +228,41 @@ class NodeHandle:
     ) -> Dict[str, Any]:
         return await self._cluster.wait_exit(
             self.name, timeout_ms=timeout_ms, wall_timeout_ms=wall_timeout_ms
+        )
+
+    async def wait_signal(
+        self,
+        name: Optional[str] = None,
+        *,
+        names: Optional[Sequence[str]] = None,
+        barrier: Optional[bool] = None,
+        timeout_ms: Optional[int] = 10_000,
+        from_start: bool = False,
+        wall_timeout_ms: Optional[int] = None,
+        check: bool = True,
+    ) -> Optional[SignalEvent]:
+        """Waits for this node to hit ``http://rewind/signal/<name>`` or ``/barrier/<name>``."""
+        return await self._cluster.wait_signal(
+            name,
+            names=names,
+            node=self.name,
+            barrier=barrier,
+            timeout_ms=timeout_ms,
+            from_start=from_start,
+            wall_timeout_ms=wall_timeout_ms,
+            check=check,
+        )
+
+    async def release(
+        self,
+        name: str,
+        body: Union[str, bytes] = "",
+        *,
+        status: int = 200,
+    ) -> Dict[str, Any]:
+        """Releases this node from ``http://rewind/barrier/<name>`` with ``body``."""
+        return await self._cluster.release(
+            name, body, node=self.name, status=status
         )
 
     async def crash(self) -> Dict[str, Any]:
@@ -582,6 +665,107 @@ class Cluster:
                 f"at {out.cluster_ms:.1f}ms"
             )
         return out
+
+    async def wait_any(
+        self,
+        nodes: Sequence[str],
+        contains: str,
+        *,
+        stream: str = "output",
+        timeout_ms: Optional[int] = 10_000,
+        from_start: bool = False,
+        wall_timeout_ms: Optional[int] = None,
+        check: bool = True,
+    ) -> WaitAnyResult:
+        """Waits until any node in ``nodes`` (or any node if empty) emits ``contains``."""
+        params: Dict[str, Any] = {
+            "nodes": list(nodes),
+            "contains": contains,
+            "stream": stream,
+            "from_start": from_start,
+        }
+        if timeout_ms is not None:
+            params["timeout_ms"] = timeout_ms
+        if wall_timeout_ms is not None:
+            params["wall_timeout_ms"] = wall_timeout_ms
+        res = await self._call("cluster.wait_any", params)
+        out = WaitAnyResult(
+            matched=bool(res["matched"]),
+            node=res.get("node"),
+            line=res.get("line"),
+            cluster_ns=int(res["cluster_ns"]),
+            cluster_step=int(res["cluster_step"]),
+            node_step=int(res["node_step"]),
+        )
+        if check and not out.matched:
+            raise AssertionError(
+                f"timed out waiting for any of {list(nodes)!r} ({stream}) to emit "
+                f"{contains!r} at {out.cluster_ms:.1f}ms"
+            )
+        return out
+
+    async def wait_signal(
+        self,
+        name: Optional[str] = None,
+        *,
+        names: Optional[Sequence[str]] = None,
+        node: Optional[str] = None,
+        nodes: Optional[Sequence[str]] = None,
+        barrier: Optional[bool] = None,
+        timeout_ms: Optional[int] = 10_000,
+        from_start: bool = False,
+        wall_timeout_ms: Optional[int] = None,
+        check: bool = True,
+    ) -> Optional[SignalEvent]:
+        """Waits for a guest to hit ``http://rewind/signal/<name>`` or ``/barrier/<name>``."""
+        params: Dict[str, Any] = {"from_start": from_start}
+        if name is not None:
+            params["name"] = name
+        if names is not None:
+            params["names"] = list(names)
+        if node is not None:
+            params["node"] = node
+        if nodes is not None:
+            params["nodes"] = list(nodes)
+        if barrier is not None:
+            params["barrier"] = barrier
+        if timeout_ms is not None:
+            params["timeout_ms"] = timeout_ms
+        if wall_timeout_ms is not None:
+            params["wall_timeout_ms"] = wall_timeout_ms
+        res = await self._call("cluster.wait_signal", params)
+        if res.get("matched") and res.get("signal") is not None:
+            return SignalEvent.from_dict(res["signal"])
+        if check:
+            wanted = list(names) if names is not None else ([name] if name else ["*"])
+            at_ms = int(res["cluster_ns"]) / 1_000_000.0
+            raise AssertionError(
+                f"timed out waiting for signal {wanted!r} at {at_ms:.1f}ms"
+            )
+        return None
+
+    async def release(
+        self,
+        name: str,
+        body: Union[str, bytes] = "",
+        *,
+        node: Optional[str] = None,
+        status: int = 200,
+    ) -> Dict[str, Any]:
+        """Releases guests blocked on ``http://rewind/barrier/<name>`` with HTTP ``body``."""
+        params: Dict[str, Any] = {"name": name, "status": status}
+        if node is not None:
+            params["node"] = node
+        if isinstance(body, bytes):
+            params["body_base64"] = base64.b64encode(body).decode("ascii")
+        else:
+            params["body"] = body
+        return await self._call("cluster.release", params)
+
+    async def signals(self, *, since: int = 0) -> List[SignalEvent]:
+        """Returns all recorded ``http://rewind`` signals with ``seq > since``."""
+        res = await self._call("cluster.signals", {"since": since})
+        return [SignalEvent.from_dict(d) for d in res.get("signals", [])]
 
     async def wait_exit(
         self,
