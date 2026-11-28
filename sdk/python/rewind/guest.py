@@ -8,7 +8,7 @@ Intended to be imported from *inside* a guest VM running in a Rewind cluster::
     async def main() -> None:
         info = await meta()
         await signal("ready", {"node": info["node"], "ip": info["ip"]})
-        cmd = (await barrier("dispatch")).strip()
+        cmd = await barrier("dispatch")
         await signal("done", {"cmd": cmd})
 
     asyncio.run(main())

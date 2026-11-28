@@ -26,7 +26,7 @@ async def main() -> None:
     await signal("ready", {"node": name, "ip": ip})
 
     # 2. Synchronous barrier: blocks until host calls `await c.release("dispatch", ...)`.
-    cmd = (await barrier("dispatch")).strip()
+    cmd = await barrier("dispatch")
     print(f"DISPATCHED node={name} cmd={cmd}", flush=True)
 
     # 3. Signal completion with the command we executed.
