@@ -28,7 +28,7 @@ use rewind_trace::verdict::Verdict;
 use rewind_trace::{Event, EventKind, Trace, TraceWriter};
 use rewind_vmm::DirtyLog;
 use rewind_vmm::cluster::{
-    Cluster, ClusterKeyframe, ClusterObserver, ClusterStop, NodeEncoders,
+    Cluster, ClusterKeyframe, ClusterObserver, ClusterStop, NodeEncoders, QuiescentState,
 };
 use rewind_vmm::control::ControlSignal;
 use rewind_vmm::net::{
@@ -260,19 +260,125 @@ impl ClusterObserver for SessionRecorder {
     }
 }
 
+/// Default virtual-time window of zero userspace/IPv4 progress while nodes are
+/// parked on barriers before declaring a quiescent deadlock (2 s virtual time).
+const DEFAULT_QUIESCENT_DEADLOCK_NS: u64 = 2_000_000_000;
+
+fn is_meaningful_net_progress(event: &NetEvent) -> bool {
+    match event {
+        // Linux sends periodic IPv6 MLD / Router Solicitation multicast frames
+        // even when every process in the guest is completely idle/deadlocked.
+        NetEvent::Tx { dst_mac, .. } => !dst_mac.starts_with("33:33:"),
+        NetEvent::Deliver { .. } => false,
+        NetEvent::Drop { .. }
+        | NetEvent::Duplicate { .. }
+        | NetEvent::Partition { .. }
+        | NetEvent::Heal { .. }
+        | NetEvent::NodeCrash { .. }
+        | NetEvent::NodeRestart { .. }
+        | NetEvent::LinkUpdated { .. } => true,
+    }
+}
+
+/// Deterministic deadlock detector embedded in `wait_signal` and `wait_exit`.
+struct DeadlockTracker {
+    enabled: bool,
+    target_nodes: Vec<usize>,
+    driver_nodes: Vec<usize>,
+    last_progress_ns: u64,
+    quiescent_window_ns: u64,
+    waiting_desc: String,
+    detected: Option<(&'static str, String)>,
+}
+
+impl DeadlockTracker {
+    fn note_progress(&mut self, cluster_ns: u64) {
+        self.last_progress_ns = self.last_progress_ns.max(cluster_ns);
+    }
+
+    fn check_quiescent(&mut self, cluster_ns: u64, q: &QuiescentState) -> bool {
+        if !self.enabled || self.detected.is_some() || q.has_pending_faults {
+            return false;
+        }
+        let live_targets: Vec<usize> = self
+            .target_nodes
+            .iter()
+            .copied()
+            .filter(|i| q.live_nodes.contains(i))
+            .collect();
+
+        // Tier 2: every awaited node has exited or crashed with no pending restart.
+        if live_targets.is_empty() && !self.target_nodes.is_empty() {
+            self.detected = Some((
+                "targets_dead",
+                format!(
+                    "deadlock {}: all awaited nodes have exited or crashed",
+                    self.waiting_desc
+                ),
+            ));
+            return true;
+        }
+
+        // Tier 3: every live awaited node is currently parked on a barrier.
+        if !live_targets.is_empty()
+            && live_targets
+                .iter()
+                .all(|i| q.waiting_barriers.iter().any(|(n, _)| n == i))
+        {
+            self.detected = Some((
+                "barriers_parked",
+                format!(
+                    "deadlock {}: all live awaited nodes are parked on barriers waiting for host release()",
+                    self.waiting_desc
+                ),
+            ));
+            return true;
+        }
+
+        // Tier 4: cluster has parked barriers, all live drivers (if any) are
+        // parked on barriers, and the remaining service nodes made zero
+        // userspace/IPv4 progress for `quiescent_window_ns`.
+        if !q.waiting_barriers.is_empty() {
+            let live_drivers_parked = self
+                .driver_nodes
+                .iter()
+                .filter(|i| q.live_nodes.contains(i))
+                .all(|i| q.waiting_barriers.iter().any(|(n, _)| n == i));
+            if live_drivers_parked
+                && cluster_ns.saturating_sub(self.last_progress_ns) >= self.quiescent_window_ns
+            {
+                self.detected = Some((
+                    "quiescent_deadlock",
+                    format!(
+                        "deadlock {}: cluster made zero progress for {}ms virtual time while nodes are parked on barriers",
+                        self.waiting_desc,
+                        self.quiescent_window_ns / 1_000_000,
+                    ),
+                ));
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
 /// Observer wrapper that stops as soon as a matching `http://rewind` signal or
-/// barrier arrives from any allowed node.
+/// barrier arrives from any allowed node, or a deadlock is detected.
 struct WaitSignalObserver<'a> {
     rec: &'a mut SessionRecorder,
     names: Option<&'a [String]>,
     nodes: Option<&'a [usize]>,
     barrier: Option<bool>,
     matched: Option<ControlSignal>,
+    deadlock: &'a mut DeadlockTracker,
+    last_ns: u64,
 }
 
 impl ClusterObserver for WaitSignalObserver<'_> {
     fn node_record(&mut self, node: usize, step: u64, record: &[u8]) {
         self.rec.record_event(node, step, record);
+        self.deadlock.note_progress(self.last_ns);
     }
 
     fn node_serial(&mut self, node: usize, _step: u64, byte: u8) {
@@ -281,10 +387,15 @@ impl ClusterObserver for WaitSignalObserver<'_> {
 
     fn net_event(&mut self, event: &NetEvent) {
         self.rec.record_net(event);
+        if is_meaningful_net_progress(event) {
+            self.deadlock.note_progress(self.last_ns);
+        }
     }
 
     fn control_signal(&mut self, signal: &ControlSignal) {
+        self.last_ns = self.last_ns.max(signal.ns);
         self.rec.record_signal(signal);
+        self.deadlock.note_progress(signal.ns);
         if self.matched.is_none()
             && let Some(found) =
                 self.rec
@@ -294,20 +405,31 @@ impl ClusterObserver for WaitSignalObserver<'_> {
         }
     }
 
+    fn on_quiescent(&mut self, cluster_ns: u64, state: &QuiescentState) -> bool {
+        self.last_ns = self.last_ns.max(cluster_ns);
+        if self.matched.is_some() {
+            return true;
+        }
+        self.deadlock.check_quiescent(cluster_ns, state)
+    }
+
     fn stop(&self) -> bool {
-        self.matched.is_some()
+        self.matched.is_some() || self.deadlock.detected.is_some()
     }
 }
 
-/// Observer wrapper that stops as soon as `target_node` exits.
+/// Observer wrapper that stops as soon as `target_node` exits or deadlocks.
 struct WaitExitObserver<'a> {
     rec: &'a mut SessionRecorder,
-    target_node: usize,
+    target_node: Option<usize>,
+    deadlock: &'a mut DeadlockTracker,
+    last_ns: u64,
 }
 
 impl ClusterObserver for WaitExitObserver<'_> {
     fn node_record(&mut self, node: usize, step: u64, record: &[u8]) {
         self.rec.record_event(node, step, record);
+        self.deadlock.note_progress(self.last_ns);
     }
 
     fn node_serial(&mut self, node: usize, _step: u64, byte: u8) {
@@ -316,14 +438,31 @@ impl ClusterObserver for WaitExitObserver<'_> {
 
     fn net_event(&mut self, event: &NetEvent) {
         self.rec.record_net(event);
+        if is_meaningful_net_progress(event) {
+            self.deadlock.note_progress(self.last_ns);
+        }
     }
 
     fn control_signal(&mut self, signal: &ControlSignal) {
+        self.last_ns = self.last_ns.max(signal.ns);
         self.rec.record_signal(signal);
+        self.deadlock.note_progress(signal.ns);
+    }
+
+    fn on_quiescent(&mut self, cluster_ns: u64, state: &QuiescentState) -> bool {
+        self.last_ns = self.last_ns.max(cluster_ns);
+        if let Some(idx) = self.target_node
+            && self.rec.statuses[idx].is_some()
+        {
+            return true;
+        }
+        self.deadlock.check_quiescent(cluster_ns, state)
     }
 
     fn stop(&self) -> bool {
-        self.rec.statuses[self.target_node].is_some()
+        self.target_node
+            .is_some_and(|idx| self.rec.statuses[idx].is_some())
+            || self.deadlock.detected.is_some()
     }
 }
 
@@ -415,6 +554,33 @@ pub struct NodeStatus {
     pub exit_code: Option<i32>,
 }
 
+/// One guest connection currently parked on `http://rewind/barrier/<name>`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ParkedBarrier {
+    pub node: String,
+    pub name: String,
+}
+
+/// Per-node state summary included in [`DeadlockInfo`].
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeadlockNodeState {
+    pub name: String,
+    pub state: String,
+}
+
+/// Structured deadlock diagnostic returned when `wait_signal` or `wait_exit`
+/// detects that the awaited condition can never be satisfied.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeadlockInfo {
+    pub kind: String,
+    pub message: String,
+    pub cluster_ns: u64,
+    pub cluster_step: u64,
+    pub waiting_barriers: Vec<ParkedBarrier>,
+    pub unconsumed_signals: Vec<SessionSignal>,
+    pub node_states: Vec<DeadlockNodeState>,
+}
+
 /// Overall live cluster status.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ClusterStatus {
@@ -426,6 +592,7 @@ pub struct ClusterStatus {
     pub cluster_step: u64,
     pub stats: NetStats,
     pub active_partitions: Vec<(String, String)>,
+    pub waiting_barriers: Vec<ParkedBarrier>,
     pub nodes: Vec<NodeStatus>,
 }
 
@@ -457,6 +624,12 @@ pub struct WaitSignalResult {
     pub signal: Option<SessionSignal>,
     pub cluster_ns: u64,
     pub cluster_step: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadlock: Option<DeadlockInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waiting_barriers: Vec<ParkedBarrier>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unconsumed_signals: Vec<SessionSignal>,
 }
 
 /// Result of `ClusterSession::wait_exit`.
@@ -466,6 +639,8 @@ pub struct WaitExitResult {
     pub exit_code: Option<i32>,
     pub cluster_ns: u64,
     pub cluster_step: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadlock: Option<DeadlockInfo>,
 }
 
 /// Result of `ClusterSession::screenshot`.
@@ -711,6 +886,7 @@ impl ClusterSession {
             .into_iter()
             .map(|(a, b)| (self.node_names[a].clone(), self.node_names[b].clone()))
             .collect();
+        let waiting_barriers = self.waiting_barriers();
         ClusterStatus {
             id: self.prepared.id.as_str().to_string(),
             name: self.prepared.manifest.name.clone(),
@@ -720,7 +896,111 @@ impl ClusterSession {
             cluster_step: self.cluster.cluster_step(),
             stats: self.cluster.switch_stats(),
             active_partitions,
+            waiting_barriers,
             nodes: self.node_statuses(),
+        }
+    }
+
+    fn waiting_barriers(&self) -> Vec<ParkedBarrier> {
+        self.cluster
+            .waiting_barriers()
+            .into_iter()
+            .map(|(idx, name)| ParkedBarrier {
+                node: self
+                    .node_names
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("node-{idx}")),
+                name,
+            })
+            .collect()
+    }
+
+    fn unconsumed_signals(&self) -> Vec<SessionSignal> {
+        self.recorder
+            .signals
+            .iter()
+            .filter(|s| !self.recorder.consumed_signals.contains(&s.seq))
+            .cloned()
+            .map(|s| self.format_signal(s))
+            .collect()
+    }
+
+    fn driver_node_indices(&self) -> Vec<usize> {
+        self.prepared
+            .manifest
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, nm)| nm.role == "driver")
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn build_deadlock_info(&self, kind: &str, base_message: String) -> DeadlockInfo {
+        let waiting_barriers = self.waiting_barriers();
+        let unconsumed_signals = self.unconsumed_signals();
+        let raw_barriers = self.cluster.waiting_barriers();
+        let node_states: Vec<DeadlockNodeState> = self
+            .node_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let state = if let Some(raw) = self.recorder.statuses[i] {
+                    format!("exited:{}", decode_exit_code(raw))
+                } else if self.cluster.node_is_exited(i) {
+                    "exited".into()
+                } else if self.cluster.node_is_crashed(i) {
+                    "crashed".into()
+                } else {
+                    let bars: Vec<&str> = raw_barriers
+                        .iter()
+                        .filter(|(idx, _)| *idx == i)
+                        .map(|(_, b)| b.as_str())
+                        .collect();
+                    if !bars.is_empty() {
+                        format!("parked:{}", bars.join(","))
+                    } else if self.cluster.node_is_idle(i) {
+                        "idle".into()
+                    } else {
+                        "running".into()
+                    }
+                };
+                DeadlockNodeState {
+                    name: name.clone(),
+                    state,
+                }
+            })
+            .collect();
+
+        let states_summary: Vec<String> = node_states
+            .iter()
+            .map(|ns| format!("{}={}", ns.name, ns.state))
+            .collect();
+        let mut message = format!(
+            "{base_message} at {:.1}ms [{}]",
+            self.cluster.cluster_ns() as f64 / 1_000_000.0,
+            states_summary.join(", "),
+        );
+        if !unconsumed_signals.is_empty() {
+            let sigs: Vec<String> = unconsumed_signals
+                .iter()
+                .map(|s| {
+                    let kind_tag = if s.barrier { "barrier" } else { "signal" };
+                    format!("{}:{}:{}", s.node, kind_tag, s.name)
+                })
+                .collect();
+            message.push_str(&format!("; unconsumed: [{}]", sigs.join(", ")));
+        }
+
+        DeadlockInfo {
+            kind: kind.into(),
+            message,
+            cluster_ns: self.cluster.cluster_ns(),
+            cluster_step: self.cluster.cluster_step(),
+            waiting_barriers,
+            unconsumed_signals,
+            node_states,
         }
     }
 
@@ -848,6 +1128,17 @@ impl ClusterSession {
         timeout_ns: Option<u64>,
         wall_timeout: Option<Duration>,
     ) -> Result<WaitExitResult> {
+        self.wait_exit_with_deadlock(node_name, timeout_ns, wall_timeout, true)
+    }
+
+    /// Like [`ClusterSession::wait_exit`], with configurable deadlock detection.
+    pub fn wait_exit_with_deadlock(
+        &mut self,
+        node_name: Option<&str>,
+        timeout_ns: Option<u64>,
+        wall_timeout: Option<Duration>,
+        detect_deadlock: bool,
+    ) -> Result<WaitExitResult> {
         let target_idx = match node_name {
             Some(n) => Some(self.node_index(n)?),
             None => None,
@@ -860,12 +1151,63 @@ impl ClusterSession {
                 exit_code: Some(decode_exit_code(raw)),
                 cluster_ns: self.cluster.cluster_ns(),
                 cluster_step: self.cluster.cluster_step(),
+                deadlock: None,
             });
+        }
+
+        let driver_nodes = self.driver_node_indices();
+        let watched_nodes = match target_idx {
+            Some(idx) => vec![idx],
+            None => {
+                if self.prepared.manifest.stop_when == "driver" && !driver_nodes.is_empty() {
+                    driver_nodes.clone()
+                } else {
+                    (0..self.node_names.len()).collect()
+                }
+            }
+        };
+        let waiting_desc = match node_name {
+            Some(n) => format!("waiting for node {n:?} to exit"),
+            None => "waiting for cluster exit".into(),
+        };
+        let mut tracker = DeadlockTracker {
+            enabled: detect_deadlock,
+            target_nodes: watched_nodes,
+            driver_nodes,
+            last_progress_ns: self.cluster.cluster_ns(),
+            quiescent_window_ns: DEFAULT_QUIESCENT_DEADLOCK_NS,
+            waiting_desc: waiting_desc.clone(),
+            detected: None,
+        };
+
+        // Pre-loop deadlock check (e.g. target node already crashed or already
+        // parked on a barrier before `wait_exit` was called).
+        if detect_deadlock
+            && !self.cluster.has_in_flight_network()
+            && !self.cluster.has_pending_faults()
+        {
+            let q = self.cluster.quiescent_state(None);
+            let all_live_targets_idle = tracker
+                .target_nodes
+                .iter()
+                .filter(|i| q.live_nodes.contains(i))
+                .all(|&i| self.cluster.node_is_idle(i));
+            if all_live_targets_idle && tracker.check_quiescent(self.cluster.cluster_ns(), &q) {
+                let (kind, msg) = tracker.detected.take().expect("deadlock set");
+                return Ok(WaitExitResult {
+                    exited: false,
+                    exit_code: None,
+                    cluster_ns: self.cluster.cluster_ns(),
+                    cluster_step: self.cluster.cluster_step(),
+                    deadlock: Some(self.build_deadlock_info(kind, msg)),
+                });
+            }
         }
 
         let target_ns = timeout_ns.map(|d| self.cluster.cluster_ns().saturating_add(d));
         let deadline = wall_timeout.map(|d| Instant::now() + d);
 
+        let mut stalled = false;
         let exited = loop {
             let chunk_target = match (target_ns, self.keyframes_mode) {
                 (Some(t), Keyframes::Take) => Some(t.min(self.next_kf_ns)),
@@ -873,16 +1215,14 @@ impl ClusterSession {
                 (None, Keyframes::Take) => Some(self.next_kf_ns),
                 (None, Keyframes::Skip | Keyframes::AtExit) => None,
             };
-            let out = if let Some(idx) = target_idx {
-                let mut obs = WaitExitObserver {
-                    rec: &mut self.recorder,
-                    target_node: idx,
-                };
-                self.cluster.run(&mut obs, chunk_target, deadline)?
-            } else {
-                self.cluster
-                    .run(&mut self.recorder, chunk_target, deadline)?
+            let start_ns = self.cluster.cluster_ns();
+            let mut obs = WaitExitObserver {
+                rec: &mut self.recorder,
+                target_node: target_idx,
+                deadlock: &mut tracker,
+                last_ns: start_ns,
             };
+            let out = self.cluster.run(&mut obs, chunk_target, deadline)?;
             self.last_stop = out.stop;
             if let Some(idx) = target_idx
                 && self.recorder.statuses[idx].is_some()
@@ -891,6 +1231,13 @@ impl ClusterSession {
             }
             if out.stop == ClusterStop::Completed {
                 break true;
+            }
+            if tracker.detected.is_some() {
+                break false;
+            }
+            if out.stop == ClusterStop::Stalled {
+                stalled = true;
+                break false;
             }
             if out.stop != ClusterStop::Paused {
                 break false;
@@ -903,6 +1250,21 @@ impl ClusterSession {
             }
         };
 
+        let deadlock = if exited || !detect_deadlock {
+            None
+        } else if let Some((kind, msg)) = tracker.detected.take() {
+            Some(self.build_deadlock_info(kind, msg))
+        } else if stalled {
+            Some(self.build_deadlock_info(
+                "stalled",
+                format!(
+                    "deadlock {waiting_desc}: all live nodes idle with no timers, packets, or faults"
+                ),
+            ))
+        } else {
+            None
+        };
+
         let exit_code = target_idx
             .and_then(|idx| self.recorder.statuses[idx])
             .map(decode_exit_code);
@@ -911,6 +1273,7 @@ impl ClusterSession {
             exit_code,
             cluster_ns: self.cluster.cluster_ns(),
             cluster_step: self.cluster.cluster_step(),
+            deadlock,
         })
     }
 
@@ -1099,6 +1462,21 @@ impl ClusterSession {
         from_start: bool,
         wall_timeout: Option<Duration>,
     ) -> Result<WaitSignalResult> {
+        self.wait_signal_with_deadlock(names, nodes, barrier, timeout_ns, from_start, wall_timeout, true)
+    }
+
+    /// Like [`ClusterSession::wait_signal`], with configurable deadlock detection.
+    #[allow(clippy::too_many_arguments, reason = "wait_signal filter and timeout parameters")]
+    pub fn wait_signal_with_deadlock(
+        &mut self,
+        names: Option<&[String]>,
+        nodes: Option<&[String]>,
+        barrier: Option<bool>,
+        timeout_ns: Option<u64>,
+        from_start: bool,
+        wall_timeout: Option<Duration>,
+        detect_deadlock: bool,
+    ) -> Result<WaitSignalResult> {
         let node_indices = match nodes {
             Some(list) if !list.is_empty() => {
                 let mut out = Vec::with_capacity(list.len());
@@ -1122,12 +1500,67 @@ impl ClusterSession {
                 signal: Some(self.format_signal(sig)),
                 cluster_ns: self.cluster.cluster_ns(),
                 cluster_step: self.cluster.cluster_step(),
+                deadlock: None,
+                waiting_barriers: Vec::new(),
+                unconsumed_signals: Vec::new(),
             });
+        }
+
+        let watched_nodes = node_indices
+            .clone()
+            .unwrap_or_else(|| (0..self.node_names.len()).collect());
+        let wanted_desc = match names_filter {
+            Some(ns) => format!("{ns:?}"),
+            None => "['*']".into(),
+        };
+        let kind_word = match barrier {
+            Some(true) => "barrier",
+            Some(false) => "signal",
+            None => "signal/barrier",
+        };
+        let waiting_desc = format!("waiting for {kind_word} {wanted_desc}");
+
+        let mut tracker = DeadlockTracker {
+            enabled: detect_deadlock,
+            target_nodes: watched_nodes,
+            driver_nodes: self.driver_node_indices(),
+            last_progress_ns: self.cluster.cluster_ns(),
+            quiescent_window_ns: DEFAULT_QUIESCENT_DEADLOCK_NS,
+            waiting_desc: waiting_desc.clone(),
+            detected: None,
+        };
+
+        // Pre-loop deadlock check (e.g. awaited nodes already exited, crashed,
+        // or parked on non-matching barriers before `wait_signal` was called).
+        if detect_deadlock
+            && !self.cluster.has_in_flight_network()
+            && !self.cluster.has_pending_faults()
+        {
+            let q = self.cluster.quiescent_state(None);
+            let all_live_targets_idle = tracker
+                .target_nodes
+                .iter()
+                .filter(|i| q.live_nodes.contains(i))
+                .all(|&i| self.cluster.node_is_idle(i));
+            if all_live_targets_idle && tracker.check_quiescent(self.cluster.cluster_ns(), &q) {
+                let (kind, msg) = tracker.detected.take().expect("deadlock set");
+                let info = self.build_deadlock_info(kind, msg);
+                return Ok(WaitSignalResult {
+                    matched: false,
+                    signal: None,
+                    cluster_ns: self.cluster.cluster_ns(),
+                    cluster_step: self.cluster.cluster_step(),
+                    waiting_barriers: info.waiting_barriers.clone(),
+                    unconsumed_signals: info.unconsumed_signals.clone(),
+                    deadlock: Some(info),
+                });
+            }
         }
 
         let target_ns = timeout_ns.map(|d| self.cluster.cluster_ns().saturating_add(d));
         let deadline = wall_timeout.map(|d| Instant::now() + d);
 
+        let mut stalled = false;
         let matched = loop {
             let chunk_target = match (target_ns, self.keyframes_mode) {
                 (Some(t), Keyframes::Take) => Some(t.min(self.next_kf_ns)),
@@ -1135,18 +1568,28 @@ impl ClusterSession {
                 (None, Keyframes::Take) => Some(self.next_kf_ns),
                 (None, Keyframes::Skip | Keyframes::AtExit) => None,
             };
+            let start_ns = self.cluster.cluster_ns();
             let mut obs = WaitSignalObserver {
                 rec: &mut self.recorder,
                 names: names_filter,
                 nodes: node_indices.as_deref(),
                 barrier,
                 matched: None,
+                deadlock: &mut tracker,
+                last_ns: start_ns,
             };
             let out = self.cluster.run(&mut obs, chunk_target, deadline)?;
             let found = obs.matched.take();
             self.last_stop = out.stop;
             if let Some(sig) = found {
                 break Some(sig);
+            }
+            if tracker.detected.is_some() {
+                break None;
+            }
+            if out.stop == ClusterStop::Stalled {
+                stalled = true;
+                break None;
             }
             if out.stop != ClusterStop::Paused {
                 break None;
@@ -1159,11 +1602,48 @@ impl ClusterSession {
             }
         };
 
+        if let Some(sig) = matched {
+            return Ok(WaitSignalResult {
+                matched: true,
+                signal: Some(self.format_signal(sig)),
+                cluster_ns: self.cluster.cluster_ns(),
+                cluster_step: self.cluster.cluster_step(),
+                deadlock: None,
+                waiting_barriers: Vec::new(),
+                unconsumed_signals: Vec::new(),
+            });
+        }
+
+        let deadlock = if !detect_deadlock {
+            None
+        } else if let Some((kind, msg)) = tracker.detected.take() {
+            Some(self.build_deadlock_info(kind, msg))
+        } else if stalled {
+            Some(self.build_deadlock_info(
+                "stalled",
+                format!(
+                    "deadlock {waiting_desc}: all live nodes idle with no timers, packets, or faults"
+                ),
+            ))
+        } else {
+            None
+        };
+
+        let waiting_barriers = deadlock
+            .as_ref()
+            .map_or_else(|| self.waiting_barriers(), |d| d.waiting_barriers.clone());
+        let unconsumed_signals = deadlock
+            .as_ref()
+            .map_or_else(|| self.unconsumed_signals(), |d| d.unconsumed_signals.clone());
+
         Ok(WaitSignalResult {
-            matched: matched.is_some(),
-            signal: matched.map(|s| self.format_signal(s)),
+            matched: false,
+            signal: None,
             cluster_ns: self.cluster.cluster_ns(),
             cluster_step: self.cluster.cluster_step(),
+            deadlock,
+            waiting_barriers,
+            unconsumed_signals,
         })
     }
 

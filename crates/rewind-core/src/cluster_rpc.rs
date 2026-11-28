@@ -371,6 +371,8 @@ fn dispatch(
                 #[serde(default)]
                 from_start: bool,
                 wall_timeout_ms: Option<u64>,
+                #[serde(default = "default_true")]
+                detect_deadlock: bool,
             }
             let p: P = serde_json::from_value(params)
                 .context("invalid params for cluster.wait_signal")?;
@@ -387,13 +389,14 @@ fn dispatch(
             let timeout_ns = p.timeout_ms.map(|m| m.saturating_mul(1_000_000));
             let wall = p.wall_timeout_ms.map(Duration::from_millis);
             let s = require_session(session)?;
-            Ok(serde_json::to_value(s.wait_signal(
+            Ok(serde_json::to_value(s.wait_signal_with_deadlock(
                 names.as_deref(),
                 nodes.as_deref(),
                 p.barrier,
                 timeout_ns,
                 p.from_start,
                 wall,
+                p.detect_deadlock,
             )?)?)
         }
         "cluster.release" => {
@@ -448,15 +451,18 @@ fn dispatch(
                 node: Option<String>,
                 timeout_ms: Option<u64>,
                 wall_timeout_ms: Option<u64>,
+                #[serde(default = "default_true")]
+                detect_deadlock: bool,
             }
             let p: P = serde_json::from_value(params).unwrap_or_default();
             let timeout_ns = p.timeout_ms.map(|m| m.saturating_mul(1_000_000));
             let wall = p.wall_timeout_ms.map(Duration::from_millis);
             let s = require_session(session)?;
-            Ok(serde_json::to_value(s.wait_exit(
+            Ok(serde_json::to_value(s.wait_exit_with_deadlock(
                 p.node.as_deref(),
                 timeout_ns,
                 wall,
+                p.detect_deadlock,
             )?)?)
         }
         "cluster.partition" => {

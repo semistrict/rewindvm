@@ -40,6 +40,7 @@ from .hid import (
 from .node import NodeHandle
 from .types import (
     ClusterError,
+    DeadlockError,
     Nemesis,
     SignalEvent,
 )
@@ -47,6 +48,7 @@ from .types import (
 __all__ = [
     "Cluster",
     "ClusterError",
+    "DeadlockError",
     "Nemesis",
     "NodeHandle",
     "SignalEvent",

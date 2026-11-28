@@ -218,6 +218,22 @@ impl ControlPlane {
         out
     }
 
+    /// Returns deterministically sorted `(node_idx, barrier_name)` pairs for
+    /// every guest connection currently parked on `http://rewind/barrier/<name>`.
+    pub(crate) fn waiting_barriers(&self) -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = self
+            .state
+            .conns
+            .iter()
+            .filter_map(|(k, c)| match &c.state {
+                ControlConnState::WaitingBarrier { name } => Some((k.node, name.clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Releases all connections currently blocked on `/barrier/<name>` (optionally
     /// restricted to `target_node`), sending an HTTP/1.1 response with `status`
     /// and `body`.

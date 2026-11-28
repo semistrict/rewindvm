@@ -23,9 +23,15 @@ class NodeHandle:
         *,
         timeout_ms: Optional[int] = 30_000,
         wall_timeout_ms: Optional[int] = None,
+        detect_deadlock: bool = True,
+        check: bool = True,
     ) -> Dict[str, Any]:
         return await self._cluster.wait_exit(
-            self.name, timeout_ms=timeout_ms, wall_timeout_ms=wall_timeout_ms
+            self.name,
+            timeout_ms=timeout_ms,
+            wall_timeout_ms=wall_timeout_ms,
+            detect_deadlock=detect_deadlock,
+            check=check,
         )
 
     async def wait_signal(
@@ -37,6 +43,7 @@ class NodeHandle:
         timeout_ms: Optional[int] = 10_000,
         from_start: bool = False,
         wall_timeout_ms: Optional[int] = None,
+        detect_deadlock: bool = True,
         check: bool = True,
     ) -> Optional[SignalEvent]:
         """Waits for this node to hit ``http://rewind/signal/<name>`` or ``/barrier/<name>``."""
@@ -48,6 +55,7 @@ class NodeHandle:
             timeout_ms=timeout_ms,
             from_start=from_start,
             wall_timeout_ms=wall_timeout_ms,
+            detect_deadlock=detect_deadlock,
             check=check,
         )
 

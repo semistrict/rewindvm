@@ -857,6 +857,23 @@ impl NetSwitch {
         self.blocked.contains(&(src, dst))
     }
 
+    /// Deterministically sorted `(node_idx, barrier_name)` pairs for every
+    /// guest currently blocked on `http://rewind/barrier/<name>`.
+    pub fn waiting_barriers(&self) -> Vec<(usize, String)> {
+        self.control.waiting_barriers()
+    }
+
+    /// Whether any Ethernet frame is currently in flight on the switch.
+    pub fn has_in_flight_frames(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// Whether any timed fault, nemesis tick, or ready pinned fault is pending.
+    pub fn has_pending_faults(&self, cluster_step: u64) -> bool {
+        self.next_timed_fault_ns().is_some()
+            || self.next_ready_pinned_fault_ns(cluster_step).is_some()
+    }
+
     /// Earliest timestamp of any upcoming time-scheduled fault (`at_step.is_none()`)
     /// or active nemesis tick. Step-pinned interactive faults are tracked on a
     /// separate cursor so they never alter replay horizons.

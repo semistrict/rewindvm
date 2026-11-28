@@ -11,6 +11,22 @@ class ClusterError(RuntimeError):
     """Raised when the Rewind cluster RPC server returns an error."""
 
 
+class DeadlockError(ClusterError):
+    """Raised when a cluster wait detects a deterministic deadlock."""
+
+    def __init__(self, info: Dict[str, Any]) -> None:
+        super().__init__(str(info.get("message") or "cluster deadlock detected"))
+        self.info = info
+        self.kind: str = str(info.get("kind", "deadlock"))
+        self.cluster_ns: int = int(info.get("cluster_ns", 0))
+        self.cluster_step: int = int(info.get("cluster_step", 0))
+        self.waiting_barriers = list(info.get("waiting_barriers", []))
+        self.unconsumed_signals = [
+            SignalEvent.from_dict(s) for s in info.get("unconsumed_signals", [])
+        ]
+        self.node_states = list(info.get("node_states", []))
+
+
 @dataclass
 class Nemesis:
     """Schedule-driven fault injection profile (active when schedule > 0 or nemesis=True)."""

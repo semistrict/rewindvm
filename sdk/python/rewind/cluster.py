@@ -25,6 +25,7 @@ from .node import NodeHandle
 from .rpc import AsyncRpcClient
 from .types import (
     ClusterError,
+    DeadlockError,
     Nemesis,
     SignalEvent,
 )
@@ -293,10 +294,14 @@ class Cluster:
         timeout_ms: Optional[int] = 10_000,
         from_start: bool = False,
         wall_timeout_ms: Optional[int] = None,
+        detect_deadlock: bool = True,
         check: bool = True,
     ) -> Optional[SignalEvent]:
         """Waits for a guest to hit ``http://rewind/signal/<name>`` or ``/barrier/<name>``."""
-        params: Dict[str, Any] = {"from_start": from_start}
+        params: Dict[str, Any] = {
+            "from_start": from_start,
+            "detect_deadlock": detect_deadlock,
+        }
         if name is not None:
             params["name"] = name
         if names is not None:
@@ -315,10 +320,29 @@ class Cluster:
         if res.get("matched") and res.get("signal") is not None:
             return SignalEvent.from_dict(res["signal"])
         if check:
+            if res.get("deadlock") is not None:
+                raise DeadlockError(res["deadlock"])
             wanted = list(names) if names is not None else ([name] if name else ["*"])
             at_ms = int(res["cluster_ns"]) / 1_000_000.0
+            extras: List[str] = []
+            bars = res.get("waiting_barriers") or []
+            if bars:
+                extras.append(
+                    "parked barriers: "
+                    + ", ".join(f"{b['node']}:{b['name']}" for b in bars)
+                )
+            unconsumed = res.get("unconsumed_signals") or []
+            if unconsumed:
+                extras.append(
+                    "unconsumed signals: "
+                    + ", ".join(
+                        f"{s['node']}:{'barrier' if s.get('barrier') else 'signal'}:{s['name']}"
+                        for s in unconsumed
+                    )
+                )
+            suffix = f" ({'; '.join(extras)})" if extras else ""
             raise AssertionError(
-                f"timed out waiting for signal {wanted!r} at {at_ms:.1f}ms"
+                f"timed out waiting for signal {wanted!r} at {at_ms:.1f}ms{suffix}"
             )
         return None
 
@@ -367,15 +391,20 @@ class Cluster:
         *,
         timeout_ms: Optional[int] = 30_000,
         wall_timeout_ms: Optional[int] = None,
+        detect_deadlock: bool = True,
+        check: bool = True,
     ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"detect_deadlock": detect_deadlock}
         if node is not None:
             params["node"] = node
         if timeout_ms is not None:
             params["timeout_ms"] = timeout_ms
         if wall_timeout_ms is not None:
             params["wall_timeout_ms"] = wall_timeout_ms
-        return await self._rpc.call("cluster.wait_exit", params)
+        res = await self._rpc.call("cluster.wait_exit", params)
+        if check and not res.get("exited") and res.get("deadlock") is not None:
+            raise DeadlockError(res["deadlock"])
+        return res
 
     async def partition(
         self,
