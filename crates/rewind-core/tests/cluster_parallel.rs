@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rewind_core::cluster::{
     ClusterRun, ClusterRunOptions, prepare_cluster,
 };
-use rewind_core::cluster_session::{ClusterSession, LogStream};
+use rewind_core::cluster_session::ClusterSession;
 use rewind_core::run::{CompareMachine, Keyframes};
 use rewind_core::{Guest, Home, pmu};
 use rewind_trace::cluster::{
@@ -429,7 +429,8 @@ fn snapshot_fault_snapshot_restore_and_standalone_replay() {
                 "srv",
                 "10.0.0.1",
                 "service",
-                "echo SRV_READY; while true; do /rewind/tools/bin/nc -l -p 7000 -e /bin/sh -c 'echo pong'; done",
+                "printf 'POST /signal/ready HTTP/1.1\\r\\nHost: rewind\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n' | /rewind/tools/bin/nc rewind 80 >/dev/null; \
+                 while true; do /rewind/tools/bin/nc -l -p 7000 -e /bin/sh -c 'echo pong'; done",
                 0,
                 0,
             ),
@@ -437,11 +438,15 @@ fn snapshot_fault_snapshot_restore_and_standalone_replay() {
                 "cli",
                 "10.0.0.2",
                 "driver",
-                "set -e; sleep 0.2; \
-                 echo P1=$(/rewind/tools/bin/nc -w 1 srv 7000 2>/dev/null || echo blocked); \
-                 sleep 0.3; \
-                 echo P2=$(/rewind/tools/bin/nc -w 1 srv 7000 2>/dev/null || echo blocked); \
-                 echo ALL_DONE",
+                "set -e; \
+                 sig() { printf 'POST /signal/%s HTTP/1.1\\r\\nHost: rewind\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n%s' \"$1\" \"${#2}\" \"$2\" | /rewind/tools/bin/nc rewind 80 >/dev/null; }; \
+                 bar() { printf 'GET /barrier/%s HTTP/1.1\\r\\nHost: rewind\\r\\nConnection: close\\r\\n\\r\\n' \"$1\" | /rewind/tools/bin/nc rewind 80 >/dev/null; }; \
+                 bar start; \
+                 p1=$(/rewind/tools/bin/nc -w 1 srv 7000 2>/dev/null || echo blocked); \
+                 sig p1 \"$p1\"; \
+                 bar phase2; \
+                 p2=$(/rewind/tools/bin/nc -w 1 srv 7000 2>/dev/null || echo blocked); \
+                 sig p2 \"$p2\"",
                 5,
                 500,
             ),
@@ -462,14 +467,55 @@ fn snapshot_fault_snapshot_restore_and_standalone_replay() {
         ClusterSession::start(tmp.home.clone(), &guest, &spec, PathBuf::from(".").as_path(), &opts)
             .expect("session start");
 
-    let r = session
-        .wait_for("srv", "SRV_READY", LogStream::Output, Some(5_000_000_000), false, None)
-        .expect("wait srv");
-    assert!(r.matched);
+    let srv_ready = session
+        .wait_signal(
+            Some(&["ready".into()]),
+            Some(&["srv".into()]),
+            Some(false),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait srv ready");
+    assert!(srv_ready.matched);
+    let cli_start = session
+        .wait_signal(
+            Some(&["start".into()]),
+            Some(&["cli".into()]),
+            Some(true),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait cli start barrier");
+    assert!(cli_start.matched);
+    session
+        .release_barrier("start", Some("cli"), 200, None, Vec::new())
+        .expect("release start");
+
     let p1 = session
-        .wait_for("cli", "P1=", LogStream::Output, Some(5_000_000_000), false, None)
-        .expect("wait P1");
-    assert_eq!(p1.line.as_deref(), Some("P1=pong"));
+        .wait_signal(
+            Some(&["p1".into()]),
+            Some(&["cli".into()]),
+            Some(false),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait p1");
+    assert_eq!(p1.signal.as_ref().map(|s| s.payload.as_str()), Some("pong"));
+
+    let b2 = session
+        .wait_signal(
+            Some(&["phase2".into()]),
+            Some(&["cli".into()]),
+            Some(true),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait phase2 barrier");
+    assert!(b2.matched);
 
     // Snapshot BEFORE partition, then immediately partition, then immediately
     // snapshot AFTER partition (no virtual time advance in between!).
@@ -484,10 +530,23 @@ fn snapshot_fault_snapshot_restore_and_standalone_replay() {
     );
 
     // Advance on partitioned branch -> P2 must be blocked.
+    session
+        .release_barrier("phase2", Some("cli"), 200, None, Vec::new())
+        .expect("release phase2 blocked");
     let p2_blocked = session
-        .wait_for("cli", "P2=", LogStream::Output, Some(5_000_000_000), false, None)
-        .expect("wait P2 blocked");
-    assert_eq!(p2_blocked.line.as_deref(), Some("P2=blocked"));
+        .wait_signal(
+            Some(&["p2".into()]),
+            Some(&["cli".into()]),
+            Some(false),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait p2 blocked");
+    assert_eq!(
+        p2_blocked.signal.as_ref().map(|s| s.payload.as_str()),
+        Some("blocked")
+    );
 
     // Restore `after-part` -> partition MUST still be active!
     session.restore(&snap_b).expect("restore snap_b");
@@ -495,18 +554,44 @@ fn snapshot_fault_snapshot_restore_and_standalone_replay() {
         !session.status().active_partitions.is_empty(),
         "restoring snapshot taken immediately after partition must keep partition active"
     );
+    session
+        .release_barrier("phase2", Some("cli"), 200, None, Vec::new())
+        .expect("release phase2 still blocked");
     let p2_still_blocked = session
-        .wait_for("cli", "P2=", LogStream::Output, Some(5_000_000_000), false, None)
-        .expect("wait P2 still blocked");
-    assert_eq!(p2_still_blocked.line.as_deref(), Some("P2=blocked"));
+        .wait_signal(
+            Some(&["p2".into()]),
+            Some(&["cli".into()]),
+            Some(false),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait p2 still blocked");
+    assert_eq!(
+        p2_still_blocked.signal.as_ref().map(|s| s.payload.as_str()),
+        Some("blocked")
+    );
 
     // Restore `before-part` -> partition must be gone -> P2 succeeds!
     session.restore(&snap_a).expect("restore snap_a");
     assert!(session.status().active_partitions.is_empty());
+    session
+        .release_barrier("phase2", Some("cli"), 200, None, Vec::new())
+        .expect("release phase2 ok");
     let p2_ok = session
-        .wait_for("cli", "P2=", LogStream::Output, Some(5_000_000_000), false, None)
-        .expect("wait P2 ok");
-    assert_eq!(p2_ok.line.as_deref(), Some("P2=pong"));
+        .wait_signal(
+            Some(&["p2".into()]),
+            Some(&["cli".into()]),
+            Some(false),
+            Some(5_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait p2 ok");
+    assert_eq!(
+        p2_ok.signal.as_ref().map(|s| s.payload.as_str()),
+        Some("pong")
+    );
 
     let exit = session
         .wait_exit(Some("cli"), Some(5_000_000_000), None)
@@ -670,4 +755,114 @@ fn in_place_dirty_page_restore_and_crash_fallback() {
     assert_eq!(out1.nodes, out3.nodes);
     assert_eq!(obs1.records, obs3.records, "branch 3 records diverged after crash+restore");
     assert_eq!(obs1.net, obs3.net, "branch 3 net events diverged after crash+restore");
+}
+
+#[test]
+fn deadlock_detection_on_barrier_mismatch_and_exited_target() {
+    let Some((guest, cpu)) = require_kvm_and_guest() else {
+        return;
+    };
+    let tmp = TempHome::new("deadlock");
+    let spec = ClusterSpecFile {
+        name: "deadlock-test".into(),
+        mem_mib: Some(128),
+        cores: Some(1),
+        stop_when: Some("driver".into()),
+        max_virtual_ms: Some(20_000),
+        slice_us: None,
+        packages: Vec::new(),
+        network: NetworkSpecFile {
+            subnet: Some("10.0.0.0/24".into()),
+            latency_ms: Some(1),
+            latency_us: None,
+            jitter_ms: None,
+            jitter_us: None,
+            drop_ppm: Some(0),
+            duplicate_ppm: Some(0),
+            links: Vec::new(),
+        },
+        faults: Vec::new(),
+        nemesis: None,
+        nodes: vec![
+            node_spec("srv", "10.0.0.1", "service", "exit 7", 0, 0),
+            node_spec(
+                "cli",
+                "10.0.0.2",
+                "driver",
+                "printf 'GET /barrier/actual HTTP/1.1\\r\\nHost: rewind\\r\\nConnection: close\\r\\n\\r\\n' | /rewind/tools/bin/nc rewind 80 >/dev/null",
+                0,
+                0,
+            ),
+        ],
+    };
+
+    let opts = ClusterRunOptions {
+        seed: 1,
+        schedule: 0,
+        epoch: Some(1_700_000_000),
+        cpu,
+        clock: ClockSource::Exits,
+        keyframes: Keyframes::Skip,
+        ..ClusterRunOptions::default()
+    };
+
+    let mut session =
+        ClusterSession::start(tmp.home.clone(), &guest, &spec, PathBuf::from(".").as_path(), &opts)
+            .expect("session start");
+
+    // 1. Waiting for signal from exited service fails fast with `targets_dead`.
+    let r_dead = session
+        .wait_signal(
+            Some(&["ready".into()]),
+            Some(&["srv".into()]),
+            None,
+            Some(10_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait srv");
+    assert!(!r_dead.matched);
+    let dl_dead = r_dead.deadlock.expect("expected targets_dead deadlock");
+    assert_eq!(dl_dead.kind, "targets_dead");
+    assert!(dl_dead.cluster_ns < 500_000_000);
+
+    // 2. Waiting for mismatched signal on `cli` fails fast with `barriers_parked`.
+    let r_bar = session
+        .wait_signal(
+            Some(&["typo".into()]),
+            Some(&["cli".into()]),
+            None,
+            Some(10_000_000_000),
+            false,
+            None,
+        )
+        .expect("wait cli");
+    assert!(!r_bar.matched);
+    let dl_bar = r_bar.deadlock.expect("expected barriers_parked deadlock");
+    assert_eq!(dl_bar.kind, "barriers_parked");
+    assert!(dl_bar.cluster_ns < 500_000_000);
+    assert_eq!(dl_bar.waiting_barriers.len(), 1);
+    assert_eq!(dl_bar.waiting_barriers[0].node, "cli");
+    assert_eq!(dl_bar.waiting_barriers[0].name, "actual");
+
+    // 3. `wait_exit` while parked on barrier fails fast too.
+    let r_exit = session
+        .wait_exit(Some("cli"), Some(10_000_000_000), None)
+        .expect("wait_exit cli");
+    assert!(!r_exit.exited);
+    assert_eq!(
+        r_exit.deadlock.as_ref().map(|d| d.kind.as_str()),
+        Some("barriers_parked")
+    );
+
+    // 4. Releasing the actual barrier unblocks `cli` and lets it exit cleanly.
+    let released = session
+        .release_barrier("actual", Some("cli"), 200, None, Vec::new())
+        .expect("release actual");
+    assert_eq!(released, 1);
+    let ok_exit = session
+        .wait_exit(Some("cli"), Some(5_000_000_000), None)
+        .expect("wait_exit after release");
+    assert!(ok_exit.exited && ok_exit.exit_code == Some(0));
+    assert!(ok_exit.deadlock.is_none());
 }

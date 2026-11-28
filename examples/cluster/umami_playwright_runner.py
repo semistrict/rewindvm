@@ -141,11 +141,20 @@ def wait_for_http(url: str, timeout_s: float = 120.0) -> None:
     raise RuntimeError(f"timed out waiting for {url}: {last_err}")
 
 
-def read_command(ctl) -> str:
-    line = ctl.readline()
-    if not line:
-        raise RuntimeError("EOF on /dev/rewind-console")
-    return line.decode("utf-8", errors="replace").strip()
+def rewind_signal(name: str, payload: str = "") -> None:
+    req = urllib.request.Request(
+        f"http://rewind/signal/{name}",
+        data=payload.encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "text/plain"},
+    )
+    with urllib.request.urlopen(req, timeout=30.0):
+        pass
+
+
+def rewind_barrier(name: str) -> str:
+    with urllib.request.urlopen(f"http://rewind/barrier/{name}", timeout=120.0) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 def api_request(page, method: str, path: str, token: str, payload=None):
@@ -272,11 +281,9 @@ def test_update_and_delete_website(page, token: str) -> None:
     assert "Renamed Site" not in remaining, f"site still present after delete: {remaining}"
 
 
-def test_db_partition_and_recover(page, token: str, ctl) -> None:
-    # Ask the host to partition app <-> db right now!
-    print("READY_FOR_DB_FAULT", flush=True)
-    ack = read_command(ctl)
-    assert ack == "PARTITIONED", f"expected PARTITIONED ack, got {ack!r}"
+def test_db_partition_and_recover(page, token: str) -> None:
+    # Park at `db_partition` barrier so the host partitions app <-> db cleanly.
+    rewind_barrier("db_partition")
 
     # With app partitioned from PostgreSQL, writes MUST fail (never silently succeed).
     failed = False
@@ -295,11 +302,9 @@ def test_db_partition_and_recover(page, token: str, ctl) -> None:
     except Exception:
         failed = True
     assert failed, "write succeeded even though app <-> db was partitioned!"
-    print("DB_FAULT_OBSERVED", flush=True)
 
-    # Wait for host to heal app <-> db, then verify Umami recovers cleanly.
-    ack = read_command(ctl)
-    assert ack == "HEALED", f"expected HEALED ack, got {ack!r}"
+    # Park at `db_heal` barrier until the host heals app <-> db.
+    rewind_barrier("db_heal")
 
     # Retry until Postgres connection pool reconnects after heal.
     last_err = None
@@ -408,27 +413,24 @@ def main() -> None:
                     token = parsed
             except Exception:
                 token = stored_auth
-        print("READY_LOGGED_IN", flush=True)
-
-        # Block on /dev/rewind-console so the host snapshots all 3 VMs right here
-        # (PostgreSQL migrated, Next.js warm, Chromium already logged in) and
-        # dispatches each isolated test spec via `browser.send_input("<spec>\n")`.
-        with open(CONSOLE_DEV, "rb", buffering=0) as ctl:
-            spec = read_command(ctl)
-            print(f"RUNNING:{spec}", flush=True)
-            if spec == "create_website":
-                test_create_website(page, token)
-            elif spec == "track_pageview":
-                test_track_pageview(page, context, token)
-            elif spec == "update_and_delete_website":
-                test_update_and_delete_website(page, token)
-            elif spec == "db_partition_and_recover":
-                test_db_partition_and_recover(page, token, ctl)
-            elif spec == "clean_isolation":
-                test_clean_isolation(page, token)
-            else:
-                raise ValueError(f"unknown Playwright test spec: {spec!r}")
-            print(f"PASS:{spec}", flush=True)
+        # Park on `http://rewind/barrier/dispatch` so the host snapshots all 3 VMs
+        # right here (PostgreSQL migrated, Next.js warm, Chromium already logged in)
+        # and dispatches each isolated test spec via `browser.release("dispatch", spec)`.
+        spec = rewind_barrier("dispatch")
+        print(f"RUNNING:{spec}", flush=True)
+        if spec == "create_website":
+            test_create_website(page, token)
+        elif spec == "track_pageview":
+            test_track_pageview(page, context, token)
+        elif spec == "update_and_delete_website":
+            test_update_and_delete_website(page, token)
+        elif spec == "db_partition_and_recover":
+            test_db_partition_and_recover(page, token)
+        elif spec == "clean_isolation":
+            test_clean_isolation(page, token)
+        else:
+            raise ValueError(f"unknown Playwright test spec: {spec!r}")
+        rewind_signal("pass", spec)
 
         browser.close()
     for proc in reversed(wl_procs):

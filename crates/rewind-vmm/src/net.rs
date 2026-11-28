@@ -99,6 +99,22 @@ pub enum FaultKind {
     /// Injects deterministic Linux `evdev` pointer/keyboard events into `node`'s
     /// paravirtual HID devices (`/dev/input/event0` and `/dev/input/event1`).
     HidEvents { node: usize, events: Vec<HidEvent> },
+    /// Releases waiting guest HTTP connections blocked on `http://rewind/barrier/<name>`.
+    ControlRelease {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<usize>,
+        #[serde(default = "default_http_ok")]
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        #[serde(default)]
+        body: Vec<u8>,
+    },
+}
+
+fn default_http_ok() -> u16 {
+    200
 }
 
 /// Schedule-seed-driven nemesis configuration for `rewind cluster check`.
@@ -139,6 +155,14 @@ pub struct NetSwitchConfig {
     pub links: Vec<LinkOverride>,
     pub faults: Vec<ScheduledFault>,
     pub nemesis: Option<NemesisConfig>,
+    /// Virtual IPv4 address for the switch-resident `http://rewind` control
+    /// endpoint (typically the last usable host IP in the cluster subnet, e.g.
+    /// `10.0.0.254`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_ip: Option<[u8; 4]>,
+    /// Static node metadata served by `GET http://rewind/meta`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_nodes: Vec<crate::control::ControlNodeMeta>,
 }
 
 impl Default for NetSwitchConfig {
@@ -154,6 +178,8 @@ impl Default for NetSwitchConfig {
             links: Vec::new(),
             faults: Vec::new(),
             nemesis: None,
+            control_ip: None,
+            control_nodes: Vec::new(),
         }
     }
 }
@@ -296,6 +322,10 @@ pub struct NetSwitchState {
     pub next_pinned_fault_idx: usize,
     pub next_nemesis_ns: u64,
     pub stats: NetStats,
+    #[serde(default)]
+    pub control_tx_seq: u64,
+    #[serde(default)]
+    pub control: crate::control::ControlPlaneState,
 }
 
 /// Deterministic L2 Ethernet switch and fault injector.
@@ -316,6 +346,9 @@ pub struct NetSwitch {
     next_pinned_fault_idx: usize,
     next_nemesis_ns: u64,
     stats: NetStats,
+    control_tx_seq: u64,
+    control: crate::control::ControlPlane,
+    last_control_released: usize,
 }
 
 const PURPOSE_DROP: u64 = 1;
@@ -385,6 +418,8 @@ impl NetSwitch {
             .as_ref()
             .map_or(u64::MAX, |n| n.tick_ns.max(1));
         let node_count = config.node_count;
+        let control =
+            crate::control::ControlPlane::new(config.control_ip, config.control_nodes.clone());
         NetSwitch {
             config,
             macs,
@@ -399,6 +434,9 @@ impl NetSwitch {
             next_pinned_fault_idx: 0,
             next_nemesis_ns,
             stats: NetStats::default(),
+            control_tx_seq: 0,
+            control,
+            last_control_released: 0,
         }
     }
 
@@ -425,6 +463,11 @@ impl NetSwitch {
         };
         let mut src_tx_seq = state.src_tx_seq;
         src_tx_seq.resize(node_count, 0);
+        let control = crate::control::ControlPlane::restore(
+            config.control_ip,
+            config.control_nodes.clone(),
+            state.control,
+        );
         NetSwitch {
             config,
             macs,
@@ -439,6 +482,9 @@ impl NetSwitch {
             next_pinned_fault_idx: state.next_pinned_fault_idx,
             next_nemesis_ns: state.next_nemesis_ns,
             stats: state.stats,
+            control_tx_seq: state.control_tx_seq,
+            control,
+            last_control_released: 0,
         }
     }
 
@@ -460,6 +506,45 @@ impl NetSwitch {
             next_pinned_fault_idx: self.next_pinned_fault_idx,
             next_nemesis_ns: self.next_nemesis_ns,
             stats: self.stats,
+            control_tx_seq: self.control_tx_seq,
+            control: self.control.snapshot(),
+        }
+    }
+
+    pub fn control_enabled(&self) -> bool {
+        self.control.enabled()
+    }
+
+    /// Fixed one-way latency between a guest and the switch-resident `http://rewind`
+    /// control endpoint (used as a causal self-loop lookahead bound).
+    pub fn control_latency_ns(&self) -> u64 {
+        self.config.latency_ns.max(MIN_LINK_LATENCY_NS)
+    }
+
+    /// Number of waiting barrier connections released by the most recent
+    /// [`FaultKind::ControlRelease`].
+    pub fn last_control_released(&self) -> usize {
+        self.last_control_released
+    }
+
+    fn enqueue_control_frames(&mut self, frames: Vec<(u64, usize, Vec<u8>)>) {
+        let latency = self.control_latency_ns();
+        for (base_ns, dst, frame) in frames {
+            if dst >= self.config.node_count || self.crashed.contains(&dst) {
+                continue;
+            }
+            let tx_seq = self.control_tx_seq;
+            self.control_tx_seq = tx_seq.wrapping_add(1);
+            let deliver_at_ns = base_ns.saturating_add(latency);
+            self.in_flight[dst].push(Reverse(InFlightFrame {
+                deliver_at_ns,
+                tx_at_ns: base_ns,
+                src: crate::control::CONTROL_SRC_NODE,
+                tx_seq,
+                dst,
+                dup: 0,
+                frame,
+            }));
         }
     }
 
@@ -507,16 +592,18 @@ impl NetSwitch {
         self.crashed.contains(&node)
     }
 
-    /// Routes one frame transmitted by `src` at cluster time `now_ns`.
+    /// Routes one frame transmitted by `src` at cluster time `now_ns`, returning
+    /// any guest signals emitted to the switch's virtual `http://rewind` control
+    /// endpoint.
     pub fn on_tx(
         &mut self,
         now_ns: u64,
         src: usize,
         frame: Vec<u8>,
         events: &mut Vec<NetEvent>,
-    ) {
+    ) -> Vec<crate::control::ControlSignal> {
         if frame.len() < 14 || src >= self.config.node_count {
-            return;
+            return Vec::new();
         }
         let tx_seq = self.src_tx_seq[src];
         self.src_tx_seq[src] = tx_seq.wrapping_add(1);
@@ -530,6 +617,18 @@ impl NetSwitch {
             frame_hash: hash_frame(&frame),
             summary: summarize_frame(&frame),
         });
+
+        let mut signals = Vec::new();
+        if self.control.enabled() {
+            let ctrl_out = self.control.on_frame(now_ns, src, &frame);
+            if !ctrl_out.frames.is_empty() {
+                self.enqueue_control_frames(ctrl_out.frames);
+            }
+            signals = ctrl_out.signals;
+            if dst_mac == crate::control::CONTROL_MAC {
+                return signals;
+            }
+        }
 
         let is_broadcast_or_multicast = dst_mac == [0xff; 6] || (dst_mac[0] & 1) != 0;
         let destinations: Vec<usize> = if is_broadcast_or_multicast {
@@ -660,6 +759,7 @@ impl NetSwitch {
                 }
             }
         }
+        signals
     }
 
     /// Earliest delivery timestamp of any in-flight frame across all destinations.
@@ -755,6 +855,23 @@ impl NetSwitch {
     /// Whether a frame from `src` to `dst` is currently blocked by a partition.
     pub fn is_blocked(&self, src: usize, dst: usize) -> bool {
         self.blocked.contains(&(src, dst))
+    }
+
+    /// Deterministically sorted `(node_idx, barrier_name)` pairs for every
+    /// guest currently blocked on `http://rewind/barrier/<name>`.
+    pub fn waiting_barriers(&self) -> Vec<(usize, String)> {
+        self.control.waiting_barriers()
+    }
+
+    /// Whether any Ethernet frame is currently in flight on the switch.
+    pub fn has_in_flight_frames(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// Whether any timed fault, nemesis tick, or ready pinned fault is pending.
+    pub fn has_pending_faults(&self, cluster_step: u64) -> bool {
+        self.next_timed_fault_ns().is_some()
+            || self.next_ready_pinned_fault_ns(cluster_step).is_some()
     }
 
     /// Earliest timestamp of any upcoming time-scheduled fault (`at_step.is_none()`)
@@ -982,6 +1099,7 @@ impl NetSwitch {
             }
             FaultKind::Crash { node } => {
                 if *node < self.config.node_count && self.crashed.insert(*node) {
+                    self.control.drop_node(*node);
                     self.stats.crashes += 1;
                     events.push(NetEvent::NodeCrash {
                         ns: at_ns,
@@ -1011,6 +1129,22 @@ impl NetSwitch {
                 {
                     actions.push(FaultAction::HidEvents(*node, events.clone()));
                 }
+            }
+            FaultKind::ControlRelease {
+                name,
+                node,
+                status,
+                content_type,
+                body,
+            } => {
+                let ctype = content_type
+                    .as_deref()
+                    .unwrap_or("text/plain; charset=utf-8");
+                let out = self
+                    .control
+                    .release_barrier(at_ns, name, *node, *status, ctype, body);
+                self.last_control_released = out.released;
+                self.enqueue_control_frames(out.frames);
             }
         }
     }
@@ -1677,6 +1811,8 @@ mod tests {
                 },
             ],
             nemesis: None,
+            control_ip: None,
+            control_nodes: Vec::new(),
         };
 
         let mut a = NetSwitch::new(cfg.clone());
@@ -1796,6 +1932,8 @@ mod tests {
             links: Vec::new(),
             faults: Vec::new(),
             nemesis: None,
+            control_ip: None,
+            control_nodes: Vec::new(),
         };
         let mut ab = NetSwitch::new(cfg.clone());
         let mut ba = NetSwitch::new(cfg);

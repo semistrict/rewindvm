@@ -50,7 +50,7 @@ pub const DEFAULT_SLICE_NS: u64 = 50_000;
 /// Minimum virtual-time lookahead window (5 ms) above global virtual time for
 /// nodes whose peers are partitioned, idle, or exited. Keeps partitioned nodes
 /// decoupled and parallel while bounding skew at interactive faults and
-/// keeping `wait_for` / `advance` responsive.
+/// keeping `wait_signal` / `advance` responsive.
 const UNCONSTRAINED_WINDOW_NS: u64 = 5_000_000;
 
 /// Maximum VM exits a node executes in a single round slice. Large enough that
@@ -159,6 +159,25 @@ pub struct ClusterOutcome {
     pub net_stats: NetStats,
 }
 
+/// Snapshot of cluster quiescence passed to [`ClusterObserver::on_quiescent`]
+/// whenever every live node is idle and zero network frames are in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuiescentState {
+    /// Deterministically sorted `(node_idx, barrier_name)` pairs currently
+    /// parked on `http://rewind/barrier/<name>`.
+    pub waiting_barriers: Vec<(usize, String)>,
+    /// Indices of nodes that are neither exited nor crashed.
+    pub live_nodes: Vec<usize>,
+    /// Indices of nodes that have exited.
+    pub exited_nodes: Vec<usize>,
+    /// Indices of nodes that are currently crashed.
+    pub crashed_nodes: Vec<usize>,
+    /// Whether any timed fault, nemesis tick, or ready pinned fault is pending.
+    pub has_pending_faults: bool,
+    /// Earliest upcoming guest timer across all live nodes (if any).
+    pub next_timer_ns: Option<u64>,
+}
+
 /// Receives per-node trace records and cluster-wide network/fault events.
 pub trait ClusterObserver {
     fn node_record(&mut self, _node: usize, _step: u64, _record: &[u8]) {}
@@ -167,6 +186,15 @@ pub trait ClusterObserver {
     /// Raw Ethernet frame transmitted by `src` at cluster virtual time `ns`
     /// (used for on-demand `.pcap` export during replay).
     fn net_tx_frame(&mut self, _ns: u64, _src: usize, _frame: &[u8]) {}
+    /// Guest signal or barrier arrival sent to the virtual `http://rewind` endpoint.
+    fn control_signal(&mut self, _signal: &crate::control::ControlSignal) {}
+    /// Called whenever every live node is idle and the virtual network is
+    /// quiescent (no in-flight frames or pending RX), right before jumping
+    /// virtual time to the next timer. Return `true` to pause immediately
+    /// (used for deterministic deadlock detection).
+    fn on_quiescent(&mut self, _cluster_ns: u64, _state: &QuiescentState) -> bool {
+        false
+    }
     /// Return true to pause the cluster loop at the end of the current round.
     fn stop(&self) -> bool {
         false
@@ -2681,6 +2709,63 @@ impl Cluster {
         }
     }
 
+    /// Deterministically sorted `(node_idx, barrier_name)` pairs currently
+    /// parked on `http://rewind/barrier/<name>`.
+    pub fn waiting_barriers(&self) -> Vec<(usize, String)> {
+        self.switch.waiting_barriers()
+    }
+
+    /// Whether node `idx` is currently idle (`WFI`/`HLT`) and alive.
+    pub fn node_is_idle(&self, idx: usize) -> bool {
+        self.nodes
+            .get(idx)
+            .is_some_and(|n| n.is_alive() && n.meta.as_ref().is_some_and(|m| m.is_idle))
+    }
+
+    /// Whether node `idx` has exited.
+    pub fn node_is_exited(&self, idx: usize) -> bool {
+        self.nodes.get(idx).is_some_and(|n| n.exited)
+    }
+
+    /// Whether any node has buffered/pending RX frames or the switch has
+    /// in-flight frames.
+    pub fn has_in_flight_network(&self) -> bool {
+        self.switch.has_in_flight_frames()
+            || self.nodes.iter().any(|n| {
+                !n.pending_rx.is_empty()
+                    || n.meta.as_ref().is_some_and(|m| m.net_rx_pending)
+            })
+    }
+
+    /// Whether any timed fault, nemesis tick, or ready pinned fault is pending.
+    pub fn has_pending_faults(&self) -> bool {
+        self.switch.has_pending_faults(self.cluster_step)
+    }
+
+    /// Builds a [`QuiescentState`] snapshot of the cluster right now.
+    pub fn quiescent_state(&self, next_timer_ns: Option<u64>) -> QuiescentState {
+        let mut live_nodes = Vec::new();
+        let mut exited_nodes = Vec::new();
+        let mut crashed_nodes = Vec::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.exited {
+                exited_nodes.push(i);
+            } else if n.is_alive() {
+                live_nodes.push(i);
+            } else {
+                crashed_nodes.push(i);
+            }
+        }
+        QuiescentState {
+            waiting_barriers: self.switch.waiting_barriers(),
+            live_nodes,
+            exited_nodes,
+            crashed_nodes,
+            has_pending_faults: self.switch.has_pending_faults(self.cluster_step),
+            next_timer_ns,
+        }
+    }
+
     /// Immediately applies an interactive fault (partition, heal, set_link,
     /// crash, restart) at the cluster's current `(cluster_ns, cluster_step)`
     /// and bumps `cluster_step` so each fault has a unique deterministic point.
@@ -2878,6 +2963,18 @@ impl Cluster {
                 let next_rx = self.switch.next_delivery_ns();
                 let next_timed_fault = self.switch.next_timed_fault_ns();
                 let next_pinned_fault = self.switch.next_ready_pinned_fault_ns(self.cluster_step);
+
+                if next_rx.is_none()
+                    && !self.nodes.iter().any(|n| {
+                        !n.pending_rx.is_empty()
+                            || n.meta.as_ref().is_some_and(|m| m.net_rx_pending)
+                    })
+                {
+                    let q = self.quiescent_state(next_timer);
+                    if obs.on_quiescent(self.cluster_ns, &q) {
+                        return Ok(self.outcome(ClusterStop::Paused));
+                    }
+                }
 
                 let next_wake = [next_timer, next_rx, next_timed_fault, next_pinned_fault]
                     .into_iter()
@@ -3195,7 +3292,10 @@ impl Cluster {
             all_tx.sort_by_key(|&(tx_cns, src, seq, _)| (tx_cns, src, seq));
             for (tx_cns, src, _seq, frame) in all_tx {
                 obs.net_tx_frame(tx_cns, src, &frame);
-                self.switch.on_tx(tx_cns, src, frame, &mut net_events);
+                let signals = self.switch.on_tx(tx_cns, src, frame, &mut net_events);
+                for sig in &signals {
+                    obs.control_signal(sig);
+                }
             }
             self.flush_net_events(&mut net_events, obs);
 
@@ -3406,12 +3506,28 @@ impl Cluster {
         let next_rx: Vec<Option<u64>> = (0..self.nodes.len())
             .map(|i| self.switch.next_delivery_for(i))
             .collect();
-        compute_lookahead_from(
+        let (earliest_tx, mut incoming_bound) = compute_lookahead_from(
             &states,
             &next_rx,
             |a, b| self.switch.is_blocked(a, b),
             |a, b| self.switch.link_min_latency_ns(a, b),
-        )
+        );
+        if self.switch.control_enabled() {
+            let cl = self.switch.control_latency_ns();
+            for (i, bound) in incoming_bound.iter_mut().enumerate() {
+                let et = earliest_tx[i];
+                if et != u64::MAX {
+                    *bound = (*bound).min(et.saturating_add(cl));
+                }
+            }
+        }
+        (earliest_tx, incoming_bound)
+    }
+
+    /// Number of waiting barrier connections released by the most recent
+    /// [`FaultKind::ControlRelease`].
+    pub fn last_control_released(&self) -> usize {
+        self.switch.last_control_released()
     }
 
     fn advance_cluster_ns_after_round(&mut self) {

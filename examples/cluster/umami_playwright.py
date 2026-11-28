@@ -23,6 +23,7 @@ EROFS images via `REWIND_POSTGRES_EROFS`, `REWIND_UMAMI_EROFS`, and
 `REWIND_PLAYWRIGHT_EROFS` (for non-Nix macOS Apple Silicon HVF runs).
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -31,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 
-from rewind_cluster import Cluster
+from rewind import Cluster
 
 RUNNER_SCRIPT = Path(__file__).with_name("umami_playwright_runner.py").read_text(
     encoding="utf-8"
@@ -75,23 +76,24 @@ SPECS = [
 ]
 
 
-def run_one_spec(cluster: Cluster, spec: str) -> dict:
+async def run_one_spec(cluster: Cluster, spec: str) -> dict:
     t0 = time.perf_counter()
     browser = cluster.node("browser")
-    browser.send_input(f"{spec}\n")
+    await browser.release("dispatch", spec)
 
     if spec == "db_partition_and_recover":
-        browser.wait_for("READY_FOR_DB_FAULT", from_start=True, timeout_ms=30_000)
-        cluster.partition(["db"], ["app", "browser"])
-        browser.send_input("PARTITIONED\n")
-        browser.wait_for("DB_FAULT_OBSERVED", from_start=True, timeout_ms=30_000)
-        cluster.heal()
-        browser.send_input("HEALED\n")
+        await browser.wait_signal("db_partition", barrier=True, timeout_ms=30_000)
+        await cluster.partition(["db"], ["app", "browser"])
+        await browser.release("db_partition")
+        await browser.wait_signal("db_heal", barrier=True, timeout_ms=30_000)
+        await cluster.heal()
+        await browser.release("db_heal")
 
-    browser.wait_for(f"PASS:{spec}", from_start=True, timeout_ms=60_000)
-    exit_res = browser.wait_exit(timeout_ms=30_000)
+    done = await browser.wait_signal("pass", timeout_ms=60_000)
+    assert done is not None and done.payload == spec, f"expected pass for {spec}, got {done}"
+    exit_res = await browser.wait_exit(timeout_ms=30_000)
     assert exit_res["exit_code"] == 0, f"{spec}: browser exited with {exit_res}"
-    run = cluster.finish(verdict="passed")
+    run = await cluster.finish(verdict="passed")
     return {
         "spec": spec,
         "run_id": run["id"],
@@ -100,7 +102,7 @@ def run_one_spec(cluster: Cluster, spec: str) -> dict:
     }
 
 
-def main() -> None:
+async def main() -> None:
     pg_erofs = os.environ.get("REWIND_POSTGRES_EROFS")
     umami_erofs = os.environ.get("REWIND_UMAMI_EROFS")
     pw_erofs = os.environ.get("REWIND_PLAYWRIGHT_EROFS")
@@ -110,7 +112,7 @@ def main() -> None:
     ) in ("1", "true", "yes", "on")
 
     t0 = time.perf_counter()
-    with Cluster(
+    async with Cluster(
         "umami-nextjs-playwright-3vm",
         latency_ms=1,
         jitter_us=100,
@@ -188,18 +190,14 @@ def main() -> None:
             **pw_kwargs,
         )
 
-        c.start()
+        await c.start()
         try:
-            db.wait_for("PG_READY", from_start=True, timeout_ms=60_000)
-            app.wait_for("Ready in", from_start=True, timeout_ms=90_000)
-            browser.wait_for("READY_LOGGED_IN", from_start=True, timeout_ms=90_000)
-            # Let the runner enter its blocking read on /dev/rewind-console.
-            c.advance(ms=100)
+            await browser.wait_signal("dispatch", barrier=True, timeout_ms=180_000)
             t_boot = time.perf_counter()
 
             # Snapshot the entire 3-VM stack once while Chromium is already logged in!
             t_snap0 = time.perf_counter()
-            snap = c.snapshot("logged-in")
+            snap = await c.snapshot("logged-in")
             t_snap = time.perf_counter() - t_snap0
             print(
                 f"[setup] booted Postgres + Umami (Next.js) + Chromium login in "
@@ -211,18 +209,20 @@ def main() -> None:
                 with tempfile.TemporaryDirectory(prefix="rewind-umami-snap-") as tmp:
                     snap_path = Path(tmp) / "logged-in.rwcsnap"
                     t_save0 = time.perf_counter()
-                    c.save_snapshot(snap_path, name=snap)
+                    await c.save_snapshot(snap_path, name=snap)
                     t_save = time.perf_counter() - t_save0
                     # Close the setup cluster before fanning out N parallel clusters so
                     # all host cores and memory go directly to the parallel workers.
-                    c.close()
+                    await c.close()
 
                     t_fan0 = time.perf_counter()
-                    results = Cluster.fan_out(
+                    results = await Cluster.fan_out(
                         snap_path,
                         SPECS,
                         run_one_spec,
-                        max_workers=int(os.environ.get("REWIND_FANOUT_WORKERS", str(len(SPECS)))),
+                        max_workers=int(
+                            os.environ.get("REWIND_FANOUT_WORKERS", str(len(SPECS)))
+                        ),
                         name_prefix="umami",
                     )
                     t_fan = time.perf_counter() - t_fan0
@@ -244,35 +244,32 @@ def main() -> None:
             restore_times = []
             for spec in SPECS:
                 t_r0 = time.perf_counter()
-                c.restore(snap)
+                await c.restore(snap)
                 t_restore = time.perf_counter() - t_r0
                 restore_times.append(t_restore)
 
                 t_test0 = time.perf_counter()
-                browser.send_input(f"{spec}\n")
+                await browser.release("dispatch", spec)
 
                 if spec == "db_partition_and_recover":
-                    browser.wait_for(
-                        "READY_FOR_DB_FAULT", from_start=True, timeout_ms=30_000
-                    )
-                    c.partition(["db"], ["app", "browser"])
-                    browser.send_input("PARTITIONED\n")
-                    browser.wait_for(
-                        "DB_FAULT_OBSERVED", from_start=True, timeout_ms=30_000
-                    )
-                    c.heal()
-                    browser.send_input("HEALED\n")
+                    await browser.wait_signal("db_partition", barrier=True, timeout_ms=30_000)
+                    await c.partition(["db"], ["app", "browser"])
+                    await browser.release("db_partition")
+                    await browser.wait_signal("db_heal", barrier=True, timeout_ms=30_000)
+                    await c.heal()
+                    await browser.release("db_heal")
 
-                browser.wait_for(f"PASS:{spec}", from_start=True, timeout_ms=60_000)
+                done = await browser.wait_signal("pass", timeout_ms=60_000)
+                assert done is not None and done.payload == spec, done
                 t_test = time.perf_counter() - t_test0
                 print(
                     f"[test] {spec:26s} PASS  (restore={t_restore*1000:6.1f}ms, run={t_test:5.2f}s)",
                     flush=True,
                 )
 
-            exit_res = browser.wait_exit(timeout_ms=30_000)
+            exit_res = await browser.wait_exit(timeout_ms=30_000)
             assert exit_res["exit_code"] == 0, f"browser exited with {exit_res}"
-            run = c.finish(verdict="passed")
+            run = await c.finish(verdict="passed")
             avg_restore = sum(restore_times) / len(restore_times) * 1000
             vtime_ms = exit_res["cluster_ns"] / 1e6
             print(
@@ -285,10 +282,10 @@ def main() -> None:
             if c._started:
                 for name, h in [("db", db), ("app", app), ("browser", browser)]:
                     print(f"\n=== {name} output (tail) ===", file=sys.stderr)
-                    for line in h.logs(stream="output")[-30:]:
+                    for line in (await h.logs(stream="output"))[-30:]:
                         print(line, file=sys.stderr)
             raise
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -17,6 +17,7 @@ pub mod arm64;
 pub mod boot;
 pub mod checkpoint;
 pub mod cluster;
+pub mod control;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cpu;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

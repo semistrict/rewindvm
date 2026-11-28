@@ -542,6 +542,35 @@ pub fn prepare_cluster(
         None
     };
 
+    let mut control_nodes: Vec<rewind_vmm::control::ControlNodeMeta> =
+        Vec::with_capacity(spec_file.nodes.len());
+    for (idx, n) in spec_file.nodes.iter().enumerate() {
+        control_nodes.push(rewind_vmm::control::ControlNodeMeta {
+            name: n.name.clone(),
+            ip: resolved_ips[idx].clone(),
+        });
+    }
+    // Reserve the last usable host IP in the subnet (e.g. 10.0.0.254 for /24)
+    // for the switch-resident `http://rewind` coordinator endpoint unless a
+    // user explicitly assigned that exact IP to a node.
+    let host_mask: u32 = if prefix_len == 0 {
+        u32::MAX
+    } else {
+        !0u32 >> prefix_len
+    };
+    let network_u32 = base_ip_u32 & !host_mask;
+    let candidate_ctrl_ip = Ipv4Addr::from((network_u32 | host_mask).saturating_sub(1));
+    let candidate_ctrl_str = candidate_ctrl_ip.to_string();
+    let control_ip = if !resolved_ips.iter().any(|ip| ip == &candidate_ctrl_str) {
+        hosts.push((
+            candidate_ctrl_str,
+            rewind_vmm::control::CONTROL_HOST.to_string(),
+        ));
+        Some(candidate_ctrl_ip.octets())
+    } else {
+        None
+    };
+
     let switch_seed = mix64(opts.seed ^ opts.schedule.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let net_config = NetSwitchConfig {
         node_count: spec_file.nodes.len(),
@@ -554,6 +583,8 @@ pub fn prepare_cluster(
         links,
         faults,
         nemesis,
+        control_ip,
+        control_nodes,
     };
 
     // 3. Build each node's Spec + Config.
@@ -2174,7 +2205,13 @@ pub struct VideoExportStats {
 struct NoopObserver;
 impl ClusterObserver for NoopObserver {}
 
-fn pack_bgr0_frame(width: u32, height: u32, stride: u32, src: &[u8], dst: &mut Vec<u8>) {
+pub(crate) fn pack_bgr0_frame(
+    width: u32,
+    height: u32,
+    stride: u32,
+    src: &[u8],
+    dst: &mut Vec<u8>,
+) {
     let row_bytes = (width as usize) * 4;
     let total = row_bytes * (height as usize);
     dst.resize(total, 0);
@@ -2189,6 +2226,81 @@ fn pack_bgr0_frame(width: u32, height: u32, stride: u32, src: &[u8], dst: &mut V
             }
         }
     }
+}
+
+/// Writes one packed `bgr0` frame directly to `out_path`.
+///
+/// Zero-dependency formats (`.raw`, `.bgr0`, `.bmp`, `.ppm`) are written
+/// directly in pure Rust without spawning a subprocess; compressed image
+/// formats (`.png`, `.jpg`, `.jpeg`, `.webp`) are encoded via `ffmpeg`.
+pub(crate) fn write_bgr0_image(
+    out_path: &Path,
+    width: u32,
+    height: u32,
+    bgr0: &[u8],
+) -> Result<()> {
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let ext = out_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "raw" | "bgr0" => {
+            fs::write(out_path, bgr0)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+        }
+        "bmp" => {
+            // Standard 32-bit BI_RGB top-down BMP (negative height = top-to-bottom BGRX rows).
+            let pixel_bytes = width
+                .checked_mul(height)
+                .and_then(|n| n.checked_mul(4))
+                .context("BMP dimensions overflow u32")?;
+            let file_size = 54u32.checked_add(pixel_bytes).context("BMP size overflow")?;
+            let mut hdr = [0u8; 54];
+            hdr[0..2].copy_from_slice(b"BM");
+            hdr[2..6].copy_from_slice(&file_size.to_le_bytes());
+            hdr[10..14].copy_from_slice(&54u32.to_le_bytes());
+            hdr[14..18].copy_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+            hdr[18..22].copy_from_slice(&(width as i32).to_le_bytes());
+            hdr[22..26].copy_from_slice(&(-(height as i32)).to_le_bytes());
+            hdr[26..28].copy_from_slice(&1u16.to_le_bytes()); // planes
+            hdr[28..30].copy_from_slice(&32u16.to_le_bytes()); // bpp
+            hdr[34..38].copy_from_slice(&pixel_bytes.to_le_bytes());
+            let mut f = std::io::BufWriter::new(
+                File::create(out_path)
+                    .with_context(|| format!("creating {}", out_path.display()))?,
+            );
+            f.write_all(&hdr)?;
+            f.write_all(&bgr0[..pixel_bytes as usize])?;
+            f.flush()?;
+        }
+        "ppm" => {
+            let mut f = std::io::BufWriter::new(
+                File::create(out_path)
+                    .with_context(|| format!("creating {}", out_path.display()))?,
+            );
+            write!(f, "P6\n{width} {height}\n255\n")?;
+            let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+            for px in bgr0.as_chunks::<4>().0 {
+                rgb.push(px[2]); // R
+                rgb.push(px[1]); // G
+                rgb.push(px[0]); // B
+            }
+            f.write_all(&rgb)?;
+            f.flush()?;
+        }
+        _ => {
+            let mut pipe = FfmpegPipe::spawn(out_path, &ext, width, height, 30, true)?;
+            pipe.write_frame(bgr0)?;
+            pipe.finish(out_path)?;
+        }
+    }
+    Ok(())
 }
 
 struct FfmpegPipe {
@@ -2556,5 +2668,23 @@ mod pcap_tests {
         assert_ne!(hud_a, dst);
         // Top-left pixel (far from top-right HUD badge) stays untouched.
         assert_eq!(&hud_a[0..4], &[0x10, 0x20, 0x30, 0x00]);
+
+        // Verify zero-dependency BMP, PPM, and raw BGR0 writers.
+        let dir = std::env::temp_dir().join(format!("rewind-img-test-{}", std::process::id()));
+        let bmp_path = dir.join("out.bmp");
+        let ppm_path = dir.join("out.ppm");
+        let raw_path = dir.join("out.raw");
+        write_bgr0_image(&bmp_path, 300, 64, &hud_a).unwrap();
+        write_bgr0_image(&ppm_path, 300, 64, &hud_a).unwrap();
+        write_bgr0_image(&raw_path, 300, 64, &hud_a).unwrap();
+        let bmp = fs::read(&bmp_path).unwrap();
+        assert_eq!(&bmp[0..2], b"BM");
+        assert_eq!(bmp.len(), 54 + 300 * 64 * 4);
+        assert_eq!(&bmp[54..58], &[0x10, 0x20, 0x30, 0x00]);
+        let ppm = fs::read(&ppm_path).unwrap();
+        assert!(ppm.starts_with(b"P6\n300 64\n255\n"));
+        assert_eq!(&ppm[14..17], &[0x30, 0x20, 0x10]); // RGB order
+        assert_eq!(fs::read(&raw_path).unwrap(), hud_a);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
