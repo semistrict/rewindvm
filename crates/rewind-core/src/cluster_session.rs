@@ -10,7 +10,7 @@
 //! [`ClusterRun`] that replays bit-for-bit via `rewind cluster replay` without
 //! needing the driving script or SDK.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -32,7 +32,8 @@ use rewind_vmm::cluster::{
 };
 use rewind_vmm::control::ControlSignal;
 use rewind_vmm::net::{
-    FaultKind, HidEvent, NetEvent, NetLogWriter, NetStats, NetSwitchConfig, ScheduledFault,
+    ClogMode, FaultKind, HidEvent, NetEvent, NetLogWriter, NetStats, NetSwitchConfig,
+    ScheduledFault,
 };
 
 use crate::cluster::{
@@ -276,7 +277,15 @@ fn is_meaningful_net_progress(event: &NetEvent) -> bool {
         | NetEvent::Heal { .. }
         | NetEvent::NodeCrash { .. }
         | NetEvent::NodeRestart { .. }
-        | NetEvent::LinkUpdated { .. } => true,
+        | NetEvent::LinkUpdated { .. }
+        | NetEvent::Clog { .. }
+        | NetEvent::Unclog { .. }
+        | NetEvent::NodePause { .. }
+        | NetEvent::NodeResume { .. }
+        | NetEvent::ClockStep { .. }
+        | NetEvent::ClockDrift { .. }
+        | NetEvent::NemesisToggled { .. }
+        | NetEvent::BuggifyToggled { .. } => true,
     }
 }
 
@@ -546,10 +555,17 @@ pub struct NodeStatus {
     pub ip: String,
     pub mac: String,
     pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rack: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dc: Option<String>,
     pub step: u64,
     pub local_ns: u64,
     pub boot_count: u32,
     pub crashed: bool,
+    pub paused: bool,
     pub exited: bool,
     pub exit_code: Option<i32>,
 }
@@ -590,9 +606,12 @@ pub struct ClusterStatus {
     pub schedule: u64,
     pub cluster_ns: u64,
     pub cluster_step: u64,
+    pub nemesis_enabled: bool,
+    pub buggify_enabled: bool,
     pub stats: NetStats,
     pub active_partitions: Vec<(String, String)>,
     pub waiting_barriers: Vec<ParkedBarrier>,
+    pub probes: BTreeMap<String, u64>,
     pub nodes: Vec<NodeStatus>,
 }
 
@@ -894,9 +913,12 @@ impl ClusterSession {
             schedule: self.prepared.manifest.schedule,
             cluster_ns: self.cluster.cluster_ns(),
             cluster_step: self.cluster.cluster_step(),
+            nemesis_enabled: self.cluster.nemesis_enabled(),
+            buggify_enabled: self.cluster.buggify_enabled(),
             stats: self.cluster.switch_stats(),
             active_partitions,
             waiting_barriers,
+            probes: self.cluster.probes().clone(),
             nodes: self.node_statuses(),
         }
     }
@@ -952,6 +974,8 @@ impl ClusterSession {
                     "exited".into()
                 } else if self.cluster.node_is_crashed(i) {
                     "crashed".into()
+                } else if self.cluster.node_is_paused(i) {
+                    "paused".into()
                 } else {
                     let bars: Vec<&str> = raw_barriers
                         .iter()
@@ -1022,10 +1046,14 @@ impl ClusterSession {
                         nm.mac[0], nm.mac[1], nm.mac[2], nm.mac[3], nm.mac[4], nm.mac[5]
                     ),
                     role: nm.role.clone(),
+                    zone: nm.zone.clone(),
+                    rack: nm.rack.clone(),
+                    dc: nm.dc.clone(),
                     step: o.steps,
                     local_ns: o.local_ns,
                     boot_count: o.boot_count,
                     crashed: o.crashed,
+                    paused: self.cluster.node_is_paused(i),
                     exited: self.cluster.node_exited(i),
                     exit_code,
                 }
@@ -1416,6 +1444,124 @@ impl ClusterSession {
         // Reset exit status for the new boot so wait_exit tracks the rebooted process.
         self.recorder.statuses[idx] = None;
         Ok(self.cluster.node_boot_count(idx))
+    }
+
+    /// Delays (clogs) all packets on `from -> to` (and optionally `to -> from`)
+    /// for `duration_ns` virtual time, queueing rather than dropping them.
+    pub fn clog_link(
+        &mut self,
+        from: &str,
+        to: &str,
+        duration_ns: u64,
+        bidirectional: bool,
+    ) -> Result<u64> {
+        let from_idx = self.node_index(from)?;
+        let to_idx = self.node_index(to)?;
+        let until_ns = self.cluster.cluster_ns().saturating_add(duration_ns);
+        self.apply_interactive_fault(FaultKind::ClogLink {
+            from: from_idx,
+            to: to_idx,
+            until_ns,
+        })?;
+        if bidirectional {
+            self.apply_interactive_fault(FaultKind::ClogLink {
+                from: to_idx,
+                to: from_idx,
+                until_ns,
+            })?;
+        }
+        Ok(until_ns)
+    }
+
+    /// Immediately unclogs `from -> to` (and optionally `to -> from`).
+    pub fn unclog_link(&mut self, from: &str, to: &str, bidirectional: bool) -> Result<()> {
+        let from_idx = self.node_index(from)?;
+        let to_idx = self.node_index(to)?;
+        self.apply_interactive_fault(FaultKind::UnclogLink {
+            from: from_idx,
+            to: to_idx,
+        })?;
+        if bidirectional {
+            self.apply_interactive_fault(FaultKind::UnclogLink {
+                from: to_idx,
+                to: from_idx,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Delays (clogs) packets sent and/or received by `node` for `duration_ns`.
+    pub fn clog_node(&mut self, node: &str, duration_ns: u64, mode: ClogMode) -> Result<u64> {
+        let idx = self.node_index(node)?;
+        let until_ns = self.cluster.cluster_ns().saturating_add(duration_ns);
+        self.apply_interactive_fault(FaultKind::ClogNode {
+            node: idx,
+            until_ns,
+            mode,
+        })?;
+        Ok(until_ns)
+    }
+
+    /// Immediately unclogs one node (or all clogs when `node` is `None`).
+    pub fn unclog(&mut self, node: Option<&str>) -> Result<()> {
+        match node {
+            Some(n) => {
+                let idx = self.node_index(n)?;
+                self.apply_interactive_fault(FaultKind::UnclogNode { node: idx })
+            }
+            None => self.apply_interactive_fault(FaultKind::UnclogAll),
+        }
+    }
+
+    /// Freezes `node`'s vCPU (models GC pauses / hypervisor stalls) while
+    /// queueing inbound packets until [`ClusterSession::resume`].
+    pub fn pause(&mut self, node: &str) -> Result<()> {
+        let idx = self.node_index(node)?;
+        self.apply_interactive_fault(FaultKind::Pause { node: idx })
+    }
+
+    /// Resumes a previously paused `node`.
+    pub fn resume(&mut self, node: &str) -> Result<()> {
+        let idx = self.node_index(node)?;
+        self.apply_interactive_fault(FaultKind::Resume { node: idx })
+    }
+
+    /// Steps `node`'s monotonic virtual clock forward by `delta_ns` immediately.
+    pub fn step_clock(&mut self, node: &str, delta_ns: u64) -> Result<()> {
+        let idx = self.node_index(node)?;
+        self.apply_interactive_fault(FaultKind::StepClock {
+            node: idx,
+            delta_ns,
+        })
+    }
+
+    /// Dynamically updates `node`'s clock rate drift (`ppm`) from this point on.
+    pub fn set_clock_drift(&mut self, node: &str, drift_ppm: i32) -> Result<()> {
+        let idx = self.node_index(node)?;
+        self.apply_interactive_fault(FaultKind::SetClockDrift {
+            node: idx,
+            drift_ppm,
+        })
+    }
+
+    /// Enables or disables the automatic nemesis (quiet / settle phase).
+    pub fn set_nemesis(&mut self, enabled: bool) -> Result<()> {
+        self.apply_interactive_fault(FaultKind::SetNemesis { enabled })
+    }
+
+    /// Enables or disables `http://rewind/buggify/<name>` fault injection.
+    pub fn set_buggify(&mut self, enabled: bool) -> Result<()> {
+        self.apply_interactive_fault(FaultKind::SetBuggify { enabled })
+    }
+
+    /// Returns hit counts for every `http://rewind/probe/<name>` hit so far.
+    pub fn probes(&self) -> BTreeMap<String, u64> {
+        self.cluster.probes().clone()
+    }
+
+    /// Returns activation decisions for every `http://rewind/buggify/<name>` site hit so far.
+    pub fn buggify_sites(&self) -> BTreeMap<String, bool> {
+        self.cluster.buggify_sites().clone()
     }
 
     /// Sends deterministic console input bytes to `node`'s `/dev/rewind-console`
@@ -2128,6 +2274,8 @@ impl ClusterSession {
         });
         manifest.verdict = verdict;
         manifest.trace_hash = Some(hasher.finalize().to_hex().to_string());
+        manifest.probes = self.cluster.probes().clone();
+        manifest.buggify_sites = self.cluster.buggify_sites().clone();
 
         crate::image::write_atomic(
             &dir.join(CLUSTER_MANIFEST),

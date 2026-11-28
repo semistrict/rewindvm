@@ -52,11 +52,23 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
+/// Default two-stage FDB-style BUGGIFY probabilities (25% activate per site,
+/// 25% fire per call when activated).
+pub const DEFAULT_BUGGIFY_ACTIVATE_PPM: u32 = 250_000;
+pub const DEFAULT_BUGGIFY_FIRE_PPM: u32 = 250_000;
+const BUGGIFY_PPM_SCALE: u64 = 1_000_000;
+
 /// Static per-node metadata returned by `GET http://rewind/meta`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlNodeMeta {
     pub name: String,
     pub ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dc: Option<String>,
 }
 
 /// One deterministic signal or barrier arrival sent by a guest to `http://rewind`.
@@ -102,13 +114,22 @@ struct ControlConn {
 }
 
 /// Serializable state of the virtual coordinator, captured inside
-/// [`NetSwitchState`] so snapshots preserve in-flight barriers cleanly.
+/// [`NetSwitchState`] so snapshots preserve in-flight barriers, BUGGIFY
+/// activations, and CODE_PROBE counts cleanly.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlPlaneState {
     next_conn_id: u64,
     next_signal_seq: u64,
     next_ip_id: u16,
     conns: BTreeMap<ControlConnKey, ControlConn>,
+    #[serde(default)]
+    buggify_enabled: bool,
+    #[serde(default)]
+    buggify_sites: BTreeMap<String, bool>,
+    #[serde(default)]
+    buggify_calls: BTreeMap<String, u64>,
+    #[serde(default)]
+    probes: BTreeMap<String, u64>,
 }
 
 /// Output produced by handling one guest frame or one host barrier release.
@@ -128,24 +149,62 @@ pub(crate) struct ControlOutput {
 pub(crate) struct ControlPlane {
     ip: Option<[u8; 4]>,
     nodes: Vec<ControlNodeMeta>,
+    buggify_seed: u64,
+    buggify_activate_ppm: u32,
+    buggify_fire_ppm: u32,
     state: ControlPlaneState,
 }
 
 impl ControlPlane {
-    pub(crate) fn new(ip: Option<[u8; 4]>, nodes: Vec<ControlNodeMeta>) -> ControlPlane {
+    pub(crate) fn new(
+        ip: Option<[u8; 4]>,
+        nodes: Vec<ControlNodeMeta>,
+        buggify_enabled: bool,
+        buggify_seed: u64,
+    ) -> ControlPlane {
         ControlPlane {
             ip,
             nodes,
-            state: ControlPlaneState::default(),
+            buggify_seed,
+            buggify_activate_ppm: DEFAULT_BUGGIFY_ACTIVATE_PPM,
+            buggify_fire_ppm: DEFAULT_BUGGIFY_FIRE_PPM,
+            state: ControlPlaneState {
+                buggify_enabled,
+                ..ControlPlaneState::default()
+            },
         }
     }
 
     pub(crate) fn restore(
         ip: Option<[u8; 4]>,
         nodes: Vec<ControlNodeMeta>,
+        buggify_seed: u64,
         state: ControlPlaneState,
     ) -> ControlPlane {
-        ControlPlane { ip, nodes, state }
+        ControlPlane {
+            ip,
+            nodes,
+            buggify_seed,
+            buggify_activate_ppm: DEFAULT_BUGGIFY_ACTIVATE_PPM,
+            buggify_fire_ppm: DEFAULT_BUGGIFY_FIRE_PPM,
+            state,
+        }
+    }
+
+    pub(crate) fn set_buggify(&mut self, enabled: bool) {
+        self.state.buggify_enabled = enabled;
+    }
+
+    pub(crate) fn buggify_enabled(&self) -> bool {
+        self.state.buggify_enabled
+    }
+
+    pub(crate) fn buggify_sites(&self) -> &BTreeMap<String, bool> {
+        &self.state.buggify_sites
+    }
+
+    pub(crate) fn probes(&self) -> &BTreeMap<String, u64> {
+        &self.state.probes
     }
 
     pub(crate) fn snapshot(&self) -> ControlPlaneState {
@@ -699,6 +758,51 @@ impl ControlPlane {
             }
         }
 
+        if let Some(raw_name) = path_only.strip_prefix("/buggify/") {
+            let name = percent_decode(raw_name.trim_end_matches('/'));
+            if !name.is_empty() {
+                let fire_ppm = parse_query_probability_ppm(&req.path)
+                    .unwrap_or(self.buggify_fire_ppm);
+                let (activated, fire) = self.eval_buggify(&name, fire_ppm);
+                let body = format!(
+                    r#"{{"fire":{fire},"activated":{activated},"enabled":{},"name":"{}"}}"#,
+                    self.state.buggify_enabled,
+                    json_escape(&name),
+                );
+                conn.tx_buf = format_http_response(200, "application/json", body.as_bytes());
+                conn.tx_offset = 0;
+                conn.state = ControlConnState::Sending { fin_sent: false };
+                let mut frames = Vec::new();
+                flush_tx_segments(ctrl_ip, key, conn, &mut self.state.next_ip_id, &mut frames);
+                for f in frames {
+                    out.frames.push((now_ns, src_node, f));
+                }
+                return;
+            }
+        }
+
+        if let Some(raw_name) = path_only.strip_prefix("/probe/") {
+            let name = percent_decode(raw_name.trim_end_matches('/'));
+            if !name.is_empty() {
+                let entry = self.state.probes.entry(name.clone()).or_insert(0);
+                *entry = entry.saturating_add(1);
+                let count = *entry;
+                let body = format!(
+                    r#"{{"ok":true,"name":"{}","count":{count}}}"#,
+                    json_escape(&name)
+                );
+                conn.tx_buf = format_http_response(200, "application/json", body.as_bytes());
+                conn.tx_offset = 0;
+                conn.state = ControlConnState::Sending { fin_sent: false };
+                let mut frames = Vec::new();
+                flush_tx_segments(ctrl_ip, key, conn, &mut self.state.next_ip_id, &mut frames);
+                for f in frames {
+                    out.frames.push((now_ns, src_node, f));
+                }
+                return;
+            }
+        }
+
         conn.tx_buf = format_http_response(404, "application/json", br#"{"error":"not found"}"#);
         conn.tx_offset = 0;
         conn.state = ControlConnState::Sending { fin_sent: false };
@@ -709,32 +813,111 @@ impl ControlPlane {
         }
     }
 
+    fn eval_buggify(&mut self, name: &str, fire_ppm: u32) -> (bool, bool) {
+        if !self.state.buggify_enabled {
+            return (false, false);
+        }
+        let seed = self.buggify_seed;
+        let activate_ppm = self.buggify_activate_ppm;
+        let activated = *self
+            .state
+            .buggify_sites
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                let draw = (buggify_hash(seed, name, 0) % BUGGIFY_PPM_SCALE) as u32;
+                draw < activate_ppm
+            });
+        if !activated {
+            return (false, false);
+        }
+        let calls = self.state.buggify_calls.entry(name.to_string()).or_insert(0);
+        *calls = calls.wrapping_add(1);
+        let draw = (buggify_hash(seed, name, *calls) % BUGGIFY_PPM_SCALE) as u32;
+        (true, draw < fire_ppm)
+    }
+
     fn format_meta_json(&self, src_node: usize, ctrl_ip: [u8; 4]) -> String {
         let ctrl_ip_str = format!("{}.{}.{}.{}", ctrl_ip[0], ctrl_ip[1], ctrl_ip[2], ctrl_ip[3]);
-        let (node_name, node_ip) = self
-            .nodes
-            .get(src_node)
-            .map(|m| (m.name.as_str(), m.ip.as_str()))
-            .unwrap_or(("", ""));
+        let node = self.nodes.get(src_node);
+        let node_name = node.map_or("", |m| m.name.as_str());
+        let node_ip = node.map_or("", |m| m.ip.as_str());
         let mut peers = String::from("[");
         for (i, n) in self.nodes.iter().enumerate() {
             if i > 0 {
                 peers.push(',');
             }
-            peers.push_str(&format!(
-                r#"{{"name":"{}","ip":"{}"}}"#,
-                json_escape(&n.name),
-                json_escape(&n.ip)
-            ));
+            peers.push_str(&format_node_meta_obj(n));
         }
         peers.push(']');
-        format!(
-            r#"{{"node":"{}","ip":"{}","control_ip":"{}","nodes":{peers}}}"#,
+        let mut out = format!(
+            r#"{{"node":"{}","ip":"{}","control_ip":"{}","buggify":{}"#,
             json_escape(node_name),
             json_escape(node_ip),
-            ctrl_ip_str
-        )
+            ctrl_ip_str,
+            self.state.buggify_enabled,
+        );
+        if let Some(m) = node {
+            if let Some(z) = &m.zone {
+                out.push_str(&format!(r#","zone":"{}""#, json_escape(z)));
+            }
+            if let Some(r) = &m.rack {
+                out.push_str(&format!(r#","rack":"{}""#, json_escape(r)));
+            }
+            if let Some(d) = &m.dc {
+                out.push_str(&format!(r#","dc":"{}""#, json_escape(d)));
+            }
+        }
+        out.push_str(&format!(r#","nodes":{peers}}}"#));
+        out
     }
+}
+
+fn format_node_meta_obj(n: &ControlNodeMeta) -> String {
+    let mut s = format!(
+        r#"{{"name":"{}","ip":"{}""#,
+        json_escape(&n.name),
+        json_escape(&n.ip)
+    );
+    if let Some(z) = &n.zone {
+        s.push_str(&format!(r#","zone":"{}""#, json_escape(z)));
+    }
+    if let Some(r) = &n.rack {
+        s.push_str(&format!(r#","rack":"{}""#, json_escape(r)));
+    }
+    if let Some(d) = &n.dc {
+        s.push_str(&format!(r#","dc":"{}""#, json_escape(d)));
+    }
+    s.push('}');
+    s
+}
+
+fn parse_query_probability_ppm(path: &str) -> Option<u32> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "p"
+            && let Ok(p) = v.parse::<f64>()
+            && p.is_finite()
+        {
+            let clamped = p.clamp(0.0, 1.0);
+            return Some((clamped * BUGGIFY_PPM_SCALE as f64).round() as u32);
+        }
+    }
+    None
+}
+
+fn buggify_hash(seed: u64, name: &str, call: u64) -> u64 {
+    // Deterministic FNV-1a + SplitMix64 mixing so each (seed, site, call) has
+    // independent, well-distributed bits.
+    let mut h = seed ^ 0xcbf2_9ce4_8422_2325u64;
+    for b in name.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= call.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 struct HttpRequest {
@@ -1121,8 +1304,11 @@ mod tests {
         let nodes = vec![ControlNodeMeta {
             name: "n1".into(),
             ip: "10.0.0.1".into(),
+            zone: Some("az-1".into()),
+            rack: Some("r1".into()),
+            dc: Some("us-east".into()),
         }];
-        let mut cp = ControlPlane::new(Some(ctrl_ip), nodes.clone());
+        let mut cp = ControlPlane::new(Some(ctrl_ip), nodes.clone(), true, 42);
 
         // 1. ARP resolution for 10.0.0.254
         let mut arp_req = vec![0u8; 42];
@@ -1224,7 +1410,7 @@ mod tests {
         let (body_a, _, _) = tcp_payload_from_frame(&rel_a.frames[0].2);
         assert!(String::from_utf8_lossy(body_a).ends_with("\r\n\r\nbranch-A"));
 
-        let mut cp_b = ControlPlane::restore(Some(ctrl_ip), nodes, snap);
+        let mut cp_b = ControlPlane::restore(Some(ctrl_ip), nodes, 42, snap);
         let rel_b = cp_b.release_barrier(
             6_000,
             "ready",
@@ -1236,5 +1422,137 @@ mod tests {
         assert_eq!(rel_b.released, 1);
         let (body_b, _, _) = tcp_payload_from_frame(&rel_b.frames[0].2);
         assert!(String::from_utf8_lossy(body_b).ends_with("\r\n\r\nbranch-B"));
+    }
+
+    fn http_roundtrip(
+        cp: &mut ControlPlane,
+        ctrl_ip: [u8; 4],
+        guest_mac: [u8; 6],
+        guest_ip: [u8; 4],
+        port: u16,
+        now_ns: u64,
+        req: &[u8],
+    ) -> String {
+        let syn = guest_tcp(guest_mac, guest_ip, ctrl_ip, port, 100, 0, TCP_SYN, &[]);
+        let syn_out = cp.on_frame(now_ns, 0, &syn);
+        let (_, _, isn) = tcp_payload_from_frame(&syn_out.frames[0].2);
+        let psh = guest_tcp(
+            guest_mac,
+            guest_ip,
+            ctrl_ip,
+            port,
+            101,
+            isn.wrapping_add(1),
+            TCP_PSH | TCP_ACK,
+            req,
+        );
+        let out = cp.on_frame(now_ns + 1_000, 0, &psh);
+        let (payload, _, _) = tcp_payload_from_frame(&out.frames[0].2);
+        let text = String::from_utf8_lossy(payload);
+        match text.split_once("\r\n\r\n") {
+            Some((_, b)) => b.to_string(),
+            None => text.into_owned(),
+        }
+    }
+
+    #[test]
+    fn meta_locality_buggify_two_stage_and_probes_roundtrip() {
+        let ctrl_ip = [10, 0, 0, 254];
+        let guest_ip = [10, 0, 0, 1];
+        let guest_mac = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
+        let nodes = vec![ControlNodeMeta {
+            name: "n1".into(),
+            ip: "10.0.0.1".into(),
+            zone: Some("az-a".into()),
+            rack: Some("rack-1".into()),
+            dc: Some("dc-1".into()),
+        }];
+        let mut cp = ControlPlane::new(Some(ctrl_ip), nodes.clone(), true, 12345);
+
+        let meta = http_roundtrip(
+            &mut cp,
+            ctrl_ip,
+            guest_mac,
+            guest_ip,
+            41000,
+            1_000,
+            b"GET /meta HTTP/1.1\r\nHost: rewind\r\n\r\n",
+        );
+        assert!(meta.contains(r#""zone":"az-a""#), "{meta}");
+        assert!(meta.contains(r#""rack":"rack-1""#), "{meta}");
+        assert!(meta.contains(r#""dc":"dc-1""#), "{meta}");
+        assert!(meta.contains(r#""buggify":true"#), "{meta}");
+
+        // Hit 20 distinct buggify sites with p=1.0: some activate (~25%), some do not,
+        // and re-querying any activated site always stays activated.
+        let mut port = 41001;
+        let mut activated_site = None;
+        let mut inactive_site = None;
+        for i in 0..32u32 {
+            let req = format!("GET /buggify/site-{i}?p=1.0 HTTP/1.1\r\nHost: rewind\r\n\r\n");
+            let body = http_roundtrip(
+                &mut cp,
+                ctrl_ip,
+                guest_mac,
+                guest_ip,
+                port,
+                10_000 + u64::from(i) * 5_000,
+                req.as_bytes(),
+            );
+            port += 1;
+            if body.contains(r#""activated":true"#) {
+                assert!(body.contains(r#""fire":true"#), "{body}");
+                activated_site.get_or_insert(format!("site-{i}"));
+            } else {
+                assert!(body.contains(r#""fire":false"#), "{body}");
+                inactive_site.get_or_insert(format!("site-{i}"));
+            }
+        }
+        let act = activated_site.expect("at least one site activates");
+        let inact = inactive_site.expect("at least one site stays inactive");
+        assert_eq!(cp.buggify_sites().get(&act), Some(&true));
+        assert_eq!(cp.buggify_sites().get(&inact), Some(&false));
+
+        // Disabling buggify prevents even activated sites from firing.
+        cp.set_buggify(false);
+        let req = format!("GET /buggify/{act}?p=1.0 HTTP/1.1\r\nHost: rewind\r\n\r\n");
+        let body = http_roundtrip(
+            &mut cp,
+            ctrl_ip,
+            guest_mac,
+            guest_ip,
+            port,
+            500_000,
+            req.as_bytes(),
+        );
+        port += 1;
+        assert!(body.contains(r#""fire":false"#), "{body}");
+        assert!(body.contains(r#""enabled":false"#), "{body}");
+
+        // Probes increment deterministically and survive snapshot/restore.
+        let p1 = http_roundtrip(
+            &mut cp,
+            ctrl_ip,
+            guest_mac,
+            guest_ip,
+            port,
+            600_000,
+            b"POST /probe/recovery-complete HTTP/1.1\r\nHost: rewind\r\nContent-Length: 0\r\n\r\n",
+        );
+        port += 1;
+        assert!(p1.contains(r#""count":1"#), "{p1}");
+        let snap = cp.snapshot();
+        let mut cp2 = ControlPlane::restore(Some(ctrl_ip), nodes, 12345, snap);
+        let p2 = http_roundtrip(
+            &mut cp2,
+            ctrl_ip,
+            guest_mac,
+            guest_ip,
+            port,
+            700_000,
+            b"GET /probe/recovery-complete HTTP/1.1\r\nHost: rewind\r\n\r\n",
+        );
+        assert!(p2.contains(r#""count":2"#), "{p2}");
+        assert_eq!(cp2.probes().get("recovery-complete"), Some(&2));
     }
 }

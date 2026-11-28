@@ -79,6 +79,7 @@ pub struct ClusterRunOptions {
     pub cores_override: Option<u32>,
     pub max_virtual_ms_override: Option<u64>,
     pub nemesis_enabled: bool,
+    pub buggify_enabled: bool,
     pub keyframes: Keyframes,
     pub echo: bool,
     pub wall_timeout: Option<Duration>,
@@ -102,6 +103,7 @@ impl Default for ClusterRunOptions {
             cores_override: None,
             max_virtual_ms_override: None,
             nemesis_enabled: false,
+            buggify_enabled: false,
             keyframes: Keyframes::Take,
             echo: false,
             wall_timeout: None,
@@ -515,6 +517,18 @@ pub fn prepare_cluster(
         .collect();
     let nemesis = if let Some(n) = &spec_file.nemesis {
         if opts.schedule != 0 || opts.nemesis_enabled {
+            let mut protected = std::collections::BTreeSet::new();
+            for pname in &n.protect_nodes {
+                let &idx = name_to_idx.get(pname).with_context(|| {
+                    format!("nemesis.protect_nodes references unknown node {pname:?}")
+                })?;
+                protected.insert(idx);
+            }
+            let eligible_nodes: Vec<usize> = eligible_service_nodes
+                .iter()
+                .copied()
+                .filter(|i| !protected.contains(i))
+                .collect();
             Some(NemesisConfig {
                 tick_ns: n.tick_ms.saturating_mul(1_000_000).max(1_000_000),
                 partition_prob_ppm: n.partition_prob_ppm,
@@ -522,7 +536,9 @@ pub fn prepare_cluster(
                 crash_prob_ppm: n.crash_prob_ppm,
                 restart_prob_ppm: n.restart_prob_ppm,
                 max_crashed: n.max_crashed,
-                eligible_nodes: eligible_service_nodes,
+                eligible_nodes,
+                clog_prob_ppm: n.clog_prob_ppm,
+                pause_prob_ppm: n.pause_prob_ppm,
             })
         } else {
             None
@@ -537,6 +553,8 @@ pub fn prepare_cluster(
             restart_prob_ppm: 300_000,
             max_crashed: 1,
             eligible_nodes: eligible_service_nodes,
+            clog_prob_ppm: 0,
+            pause_prob_ppm: 0,
         })
     } else {
         None
@@ -548,6 +566,9 @@ pub fn prepare_cluster(
         control_nodes.push(rewind_vmm::control::ControlNodeMeta {
             name: n.name.clone(),
             ip: resolved_ips[idx].clone(),
+            zone: n.zone.clone(),
+            rack: n.rack.clone(),
+            dc: n.dc.clone(),
         });
     }
     // Reserve the last usable host IP in the subnet (e.g. 10.0.0.254 for /24)
@@ -585,6 +606,7 @@ pub fn prepare_cluster(
         nemesis,
         control_ip,
         control_nodes,
+        buggify_enabled: opts.buggify_enabled,
     };
 
     // 3. Build each node's Spec + Config.
@@ -699,6 +721,9 @@ pub fn prepare_cluster(
             ip: resolved_ips[idx].clone(),
             mac,
             role: role_str(roles[idx]).to_string(),
+            zone: n.zone.clone(),
+            rack: n.rack.clone(),
+            dc: n.dc.clone(),
             clock_skew_ns: skew_ns,
             clock_drift_ppm: n.clock_drift_ppm,
             display: n.display,
@@ -746,6 +771,8 @@ pub fn prepare_cluster(
         outcome: None,
         verdict: ClusterVerdict::Unfinished,
         trace_hash: None,
+        probes: BTreeMap::new(),
+        buggify_sites: BTreeMap::new(),
         recorded_by: crate::VERSION.to_string(),
     };
 
@@ -1512,6 +1539,8 @@ impl ClusterRun {
         });
         manifest.verdict = verdict;
         manifest.trace_hash = Some(hasher.finalize().to_hex().to_string());
+        manifest.probes = cluster.probes().clone();
+        manifest.buggify_sites = cluster.buggify_sites().clone();
 
         crate::image::write_atomic(
             &dir.join(CLUSTER_MANIFEST),
@@ -2607,6 +2636,71 @@ pub fn format_net_event(event: &NetEvent, names: &[String]) -> String {
             *jitter_ns as f64 / 1_000_000.0,
             drop_ppm,
             duplicate_ppm,
+        ),
+        NetEvent::Clog {
+            ns,
+            from,
+            to,
+            until_ns,
+            mode,
+        } => {
+            let target = match (from, to) {
+                (Some(f), Some(t)) => format!("{} -> {}", name(*f), name(*t)),
+                (Some(n), None) => format!("{} ({:?})", name(*n), mode),
+                _ => "all".into(),
+            };
+            format!(
+                "{:>10.3}ms  CLOG     {target} until {:.3}ms",
+                *ns as f64 / 1_000_000.0,
+                *until_ns as f64 / 1_000_000.0,
+            )
+        }
+        NetEvent::Unclog { ns, from, to } => {
+            let target = match (from, to) {
+                (Some(f), Some(t)) => format!("{} -> {}", name(*f), name(*t)),
+                (Some(n), None) => name(*n).to_string(),
+                _ => "all".into(),
+            };
+            format!(
+                "{:>10.3}ms  UNCLOG   {target}",
+                *ns as f64 / 1_000_000.0,
+            )
+        }
+        NetEvent::NodePause { ns, node } => format!(
+            "{:>10.3}ms  PAUSE    {}",
+            *ns as f64 / 1_000_000.0,
+            name(*node),
+        ),
+        NetEvent::NodeResume { ns, node } => format!(
+            "{:>10.3}ms  RESUME   {}",
+            *ns as f64 / 1_000_000.0,
+            name(*node),
+        ),
+        NetEvent::ClockStep { ns, node, delta_ns } => format!(
+            "{:>10.3}ms  CLKSTEP  {} +{:.3}ms",
+            *ns as f64 / 1_000_000.0,
+            name(*node),
+            *delta_ns as f64 / 1_000_000.0,
+        ),
+        NetEvent::ClockDrift {
+            ns,
+            node,
+            drift_ppm,
+        } => format!(
+            "{:>10.3}ms  DRIFT    {} {:+}ppm",
+            *ns as f64 / 1_000_000.0,
+            name(*node),
+            drift_ppm,
+        ),
+        NetEvent::NemesisToggled { ns, enabled } => format!(
+            "{:>10.3}ms  NEMESIS  {}",
+            *ns as f64 / 1_000_000.0,
+            if *enabled { "enabled" } else { "disabled" },
+        ),
+        NetEvent::BuggifyToggled { ns, enabled } => format!(
+            "{:>10.3}ms  BUGGIFY  {}",
+            *ns as f64 / 1_000_000.0,
+            if *enabled { "enabled" } else { "disabled" },
         ),
     }
 }

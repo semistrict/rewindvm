@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 class ClusterError(RuntimeError):
@@ -37,6 +37,9 @@ class Nemesis:
     crash_prob_ppm: int = 100_000
     restart_prob_ppm: int = 300_000
     max_crashed: int = 1
+    clog_prob_ppm: int = 0
+    pause_prob_ppm: int = 0
+    protect_nodes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -46,6 +49,9 @@ class Nemesis:
             "crash_prob_ppm": self.crash_prob_ppm,
             "restart_prob_ppm": self.restart_prob_ppm,
             "max_crashed": self.max_crashed,
+            "clog_prob_ppm": self.clog_prob_ppm,
+            "pause_prob_ppm": self.pause_prob_ppm,
+            "protect_nodes": list(self.protect_nodes),
         }
 
 

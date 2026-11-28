@@ -166,8 +166,10 @@ pub struct QuiescentState {
     /// Deterministically sorted `(node_idx, barrier_name)` pairs currently
     /// parked on `http://rewind/barrier/<name>`.
     pub waiting_barriers: Vec<(usize, String)>,
-    /// Indices of nodes that are neither exited nor crashed.
+    /// Indices of nodes that are alive (neither exited, crashed, nor paused).
     pub live_nodes: Vec<usize>,
+    /// Indices of nodes that are currently paused (`FaultKind::Pause`).
+    pub paused_nodes: Vec<usize>,
     /// Indices of nodes that have exited.
     pub exited_nodes: Vec<usize>,
     /// Indices of nodes that are currently crashed.
@@ -223,6 +225,10 @@ pub struct ClusterNodeKeyframe {
     pub boot_count: u32,
     pub step_base: u64,
     pub exited: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_drift_ppm: Option<i32>,
     pub pending_rx: Vec<InFlightFrame>,
 }
 
@@ -1513,14 +1519,19 @@ struct LiveNode {
     boot_cluster_ns: u64,
     /// Local clock value at `boot_cluster_ns` (after skew).
     local_base_ns: u64,
+    /// Effective clock rate drift (ppm); starts at `cfg.clock_drift_ppm` and
+    /// may be updated dynamically via `FaultKind::SetClockDrift`.
+    clock_drift_ppm: i32,
     /// Number of times this node has booted (1 = initial boot).
     boot_count: u32,
     /// Total steps accumulated in prior boots before a crash/restart.
     step_base: u64,
     /// Whether this node's VM exited cleanly or faulted (distinct from nemesis crash).
     exited: bool,
+    /// Whether this node's vCPU is frozen via `FaultKind::Pause`.
+    paused: bool,
     last_stop: Option<Stop>,
-    /// Frames that arrived while the guest RX ring was full or before setup.
+    /// Frames that arrived while the guest RX ring was full, before setup, or while paused.
     pending_rx: VecDeque<InFlightFrame>,
 }
 
@@ -1572,7 +1583,7 @@ impl LiveNode {
         anchor_cluster_to_local_ns(
             self.boot_cluster_ns,
             self.local_base_ns,
-            self.cfg.clock_drift_ppm,
+            self.clock_drift_ppm,
             cluster_ns,
         )
     }
@@ -1581,7 +1592,7 @@ impl LiveNode {
         anchor_local_to_cluster_ns(
             self.boot_cluster_ns,
             self.local_base_ns,
-            self.cfg.clock_drift_ppm,
+            self.clock_drift_ppm,
             local_ns,
         )
     }
@@ -1590,7 +1601,7 @@ impl LiveNode {
         anchor_local_deadline_to_cluster_ns(
             self.boot_cluster_ns,
             self.local_base_ns,
-            self.cfg.clock_drift_ppm,
+            self.clock_drift_ppm,
             deadline_local,
         )
     }
@@ -1611,6 +1622,9 @@ impl LiveNode {
 
     /// Next armed local timer deadline converted to cluster virtual time.
     fn next_timer_cluster_ns(&self) -> Option<u64> {
+        if self.paused {
+            return None;
+        }
         let deadline_local = self.timer_deadline()?;
         Some(
             self.local_deadline_to_cluster_ns(deadline_local)
@@ -1620,6 +1634,7 @@ impl LiveNode {
 
     fn is_runnable(&self) -> bool {
         !self.exited
+            && !self.paused
             && self
                 .meta
                 .as_ref()
@@ -1794,6 +1809,7 @@ impl LiveNode {
         };
         self.step_base += steps;
         self.meta = None;
+        self.paused = false;
         self.pending_rx.clear();
         Ok(())
     }
@@ -1842,7 +1858,9 @@ impl LiveNode {
         self.cluster_ns = boot_cluster_ns;
         self.boot_cluster_ns = boot_cluster_ns;
         self.local_base_ns = initial_local;
+        self.clock_drift_ppm = self.cfg.clock_drift_ppm;
         self.exited = false;
+        self.paused = false;
         self.last_stop = None;
         self.pending_rx.clear();
         Ok(())
@@ -2092,9 +2110,11 @@ impl Cluster {
                     cluster_ns: 0,
                     boot_cluster_ns: 0,
                     local_base_ns: initial_local,
+                    clock_drift_ppm: node_cfg.clock_drift_ppm,
                     boot_count: 1,
                     step_base: 0,
                     exited: false,
+                    paused: false,
                     last_stop: None,
                     pending_rx: VecDeque::new(),
                 });
@@ -2116,9 +2136,11 @@ impl Cluster {
                     cluster_ns: 0,
                     boot_cluster_ns: 0,
                     local_base_ns: initial_local,
+                    clock_drift_ppm: node_cfg.clock_drift_ppm,
                     boot_count: 1,
                     step_base: 0,
                     exited: false,
+                    paused: false,
                     last_stop: None,
                     pending_rx: VecDeque::new(),
                 });
@@ -2223,9 +2245,11 @@ impl Cluster {
                     cluster_ns: last_nk.cluster_ns,
                     boot_cluster_ns: last_nk.boot_cluster_ns,
                     local_base_ns: last_nk.local_base_ns,
+                    clock_drift_ppm: last_nk.clock_drift_ppm.unwrap_or(node_cfg.clock_drift_ppm),
                     boot_count: last_nk.boot_count,
                     step_base: last_nk.step_base,
                     exited: last_nk.exited,
+                    paused: last_nk.paused,
                     last_stop: None,
                     pending_rx: last_nk.pending_rx.iter().cloned().collect(),
                 });
@@ -2316,9 +2340,11 @@ impl Cluster {
                 cluster_ns: last_nk.cluster_ns,
                 boot_cluster_ns: last_nk.boot_cluster_ns,
                 local_base_ns: last_nk.local_base_ns,
+                clock_drift_ppm: last_nk.clock_drift_ppm.unwrap_or(node_cfg.clock_drift_ppm),
                 boot_count: last_nk.boot_count,
                 step_base: last_nk.step_base,
                 exited: last_nk.exited,
+                paused: last_nk.paused,
                 last_stop: None,
                 pending_rx: last_nk.pending_rx.iter().cloned().collect(),
             });
@@ -2511,9 +2537,11 @@ impl Cluster {
             node.cluster_ns = last_nk.cluster_ns;
             node.boot_cluster_ns = last_nk.boot_cluster_ns;
             node.local_base_ns = last_nk.local_base_ns;
+            node.clock_drift_ppm = last_nk.clock_drift_ppm.unwrap_or(node.cfg.clock_drift_ppm);
             node.boot_count = last_nk.boot_count;
             node.step_base = last_nk.step_base;
             node.exited = last_nk.exited;
+            node.paused = last_nk.paused;
             node.last_stop = None;
             node.pending_rx = last_nk.pending_rx.iter().cloned().collect();
         }
@@ -2633,6 +2661,8 @@ impl Cluster {
                 boot_count: node.boot_count,
                 step_base: node.step_base,
                 exited: node.exited,
+                paused: node.paused,
+                clock_drift_ppm: Some(node.clock_drift_ppm),
                 pending_rx: node.pending_rx.iter().cloned().collect(),
             });
         }
@@ -2679,6 +2709,26 @@ impl Cluster {
 
     pub fn node_is_crashed(&self, node: usize) -> bool {
         self.switch.is_crashed(node)
+    }
+
+    pub fn node_is_paused(&self, node: usize) -> bool {
+        self.nodes.get(node).is_some_and(|n| n.paused)
+    }
+
+    pub fn nemesis_enabled(&self) -> bool {
+        self.switch.nemesis_enabled()
+    }
+
+    pub fn buggify_enabled(&self) -> bool {
+        self.switch.buggify_enabled()
+    }
+
+    pub fn buggify_sites(&self) -> &std::collections::BTreeMap<String, bool> {
+        self.switch.buggify_sites()
+    }
+
+    pub fn probes(&self) -> &std::collections::BTreeMap<String, u64> {
+        self.switch.probes()
     }
 
     pub fn node_outcomes(&self) -> Vec<ClusterNodeOutcome> {
@@ -2732,8 +2782,9 @@ impl Cluster {
     pub fn has_in_flight_network(&self) -> bool {
         self.switch.has_in_flight_frames()
             || self.nodes.iter().any(|n| {
-                !n.pending_rx.is_empty()
-                    || n.meta.as_ref().is_some_and(|m| m.net_rx_pending)
+                !n.paused
+                    && (!n.pending_rx.is_empty()
+                        || n.meta.as_ref().is_some_and(|m| m.net_rx_pending))
             })
     }
 
@@ -2745,11 +2796,14 @@ impl Cluster {
     /// Builds a [`QuiescentState`] snapshot of the cluster right now.
     pub fn quiescent_state(&self, next_timer_ns: Option<u64>) -> QuiescentState {
         let mut live_nodes = Vec::new();
+        let mut paused_nodes = Vec::new();
         let mut exited_nodes = Vec::new();
         let mut crashed_nodes = Vec::new();
         for (i, n) in self.nodes.iter().enumerate() {
             if n.exited {
                 exited_nodes.push(i);
+            } else if n.paused {
+                paused_nodes.push(i);
             } else if n.is_alive() {
                 live_nodes.push(i);
             } else {
@@ -2759,6 +2813,7 @@ impl Cluster {
         QuiescentState {
             waiting_barriers: self.switch.waiting_barriers(),
             live_nodes,
+            paused_nodes,
             exited_nodes,
             crashed_nodes,
             has_pending_faults: self.switch.has_pending_faults(self.cluster_step),
@@ -2966,8 +3021,9 @@ impl Cluster {
 
                 if next_rx.is_none()
                     && !self.nodes.iter().any(|n| {
-                        !n.pending_rx.is_empty()
-                            || n.meta.as_ref().is_some_and(|m| m.net_rx_pending)
+                        !n.paused
+                            && (!n.pending_rx.is_empty()
+                                || n.meta.as_ref().is_some_and(|m| m.net_rx_pending))
                     })
                 {
                     let q = self.quiescent_state(next_timer);
@@ -3100,7 +3156,8 @@ impl Cluster {
             }
 
             // 3b. Purge in-flight frames addressed to dead (!is_alive) nodes
-            //     whose delivery timestamp <= gvt so they cannot pin GVT.
+            //     whose delivery timestamp <= gvt so they cannot pin GVT, and
+            //     move due frames for paused nodes into their `pending_rx` queue.
             for idx in 0..n {
                 if !self.nodes[idx].is_alive() {
                     let due = self.switch.pop_due_frames_for(idx, gvt);
@@ -3112,6 +3169,8 @@ impl Cluster {
                             &mut net_events,
                         );
                     }
+                } else if self.nodes[idx].paused {
+                    self.deliver_due_frames_for(idx, gvt, &mut net_events)?;
                 }
             }
             self.flush_net_events(&mut net_events, obs);
@@ -3136,7 +3195,7 @@ impl Cluster {
                 let mut woke_any = false;
 
                 for (idx, &bound) in incoming_bound.iter().enumerate() {
-                    if !self.nodes[idx].is_alive() {
+                    if !self.nodes[idx].is_alive() || self.nodes[idx].paused {
                         continue;
                     }
                     let local_safe = bound.min(next_fault).min(max_frontier);
@@ -3494,7 +3553,7 @@ impl Cluster {
                     NodeExecState::Runnable {
                         cluster_ns: node.cluster_ns,
                     }
-                } else if node.is_alive() {
+                } else if node.is_alive() && !node.paused {
                     NodeExecState::Idle {
                         next_timer_ns: node.next_timer_cluster_ns(),
                     }
@@ -3593,6 +3652,49 @@ impl Cluster {
                     node.crash()?;
                 }
             }
+            FaultAction::Pause(idx) => {
+                if let Some(node) = self.nodes.get_mut(idx)
+                    && node.is_alive()
+                {
+                    node.paused = true;
+                }
+            }
+            FaultAction::Resume(idx) => {
+                if idx < self.nodes.len() && self.nodes[idx].is_alive() && self.nodes[idx].paused {
+                    self.nodes[idx].paused = false;
+                    let wake_ns = at_ns.max(self.cluster_ns).max(self.nodes[idx].cluster_ns);
+                    let target_local = self.nodes[idx].cluster_to_local_ns(wake_ns);
+                    self.nodes[idx].cluster_ns = wake_ns;
+                    self.nodes[idx].advance_idle_to(target_local)?;
+                    self.drain_pending_rx(idx, events)?;
+                }
+            }
+            FaultAction::StepClock(idx, delta_ns) => {
+                if idx < self.nodes.len() && self.nodes[idx].is_alive() && delta_ns > 0 {
+                    let anchor_cns = at_ns.max(self.cluster_ns).max(self.nodes[idx].cluster_ns);
+                    let cur_local = self.nodes[idx]
+                        .cluster_to_local_ns(anchor_cns)
+                        .max(self.nodes[idx].local_now());
+                    let new_local = cur_local.saturating_add(delta_ns);
+                    self.nodes[idx].boot_cluster_ns = anchor_cns;
+                    self.nodes[idx].local_base_ns = new_local;
+                    if !self.nodes[idx].paused {
+                        self.nodes[idx].cluster_ns = anchor_cns;
+                        self.nodes[idx].advance_idle_to(new_local)?;
+                    }
+                }
+            }
+            FaultAction::SetClockDrift(idx, drift_ppm) => {
+                if idx < self.nodes.len() && self.nodes[idx].is_alive() {
+                    let anchor_cns = at_ns.max(self.cluster_ns).max(self.nodes[idx].cluster_ns);
+                    let cur_local = self.nodes[idx]
+                        .cluster_to_local_ns(anchor_cns)
+                        .max(self.nodes[idx].local_now());
+                    self.nodes[idx].boot_cluster_ns = anchor_cns;
+                    self.nodes[idx].local_base_ns = cur_local;
+                    self.nodes[idx].clock_drift_ppm = drift_ppm;
+                }
+            }
             FaultAction::SendInput(idx, data) => {
                 if idx < self.nodes.len() {
                     if self.nodes[idx].is_alive() && !self.nodes[idx].is_runnable() {
@@ -3669,6 +3771,16 @@ impl Cluster {
         if self.switch.is_blocked(frame.src, dst) {
             self.switch
                 .note_dropped(frame.deliver_at_ns, &frame, DropReason::Partitioned, events);
+            return Ok(());
+        }
+        // Paused nodes freeze their vCPU and queue arriving packets until resumed.
+        if self.nodes[dst].paused {
+            if self.nodes[dst].pending_rx.len() < 512 {
+                self.nodes[dst].pending_rx.push_back(frame);
+            } else {
+                self.switch
+                    .note_dropped(frame.deliver_at_ns, &frame, DropReason::RxOverflow, events);
+            }
             return Ok(());
         }
         // Bring idle destination node's clock up to the packet arrival time
