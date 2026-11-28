@@ -13,7 +13,7 @@ if not PKG_DIR.exists():
         (PKG_DIR / src.name.removeprefix("rewind__")).write_bytes(src.read_bytes())
 sys.path.insert(0, str(BUILD_DIR))
 
-from rewind.guest import barrier, meta, signal
+from rewind.guest import barrier_json, meta, signal
 
 
 async def main() -> None:
@@ -25,12 +25,12 @@ async def main() -> None:
     # 1. One-way signal with structured JSON payload.
     await signal("ready", {"node": name, "ip": ip})
 
-    # 2. Synchronous barrier: blocks until host calls `await c.release("dispatch", ...)`.
-    cmd = await barrier("dispatch")
-    print(f"DISPATCHED node={name} cmd={cmd}", flush=True)
+    # 2. Synchronous barrier: blocks until host calls `await c.release("dispatch", {...})`.
+    task = await barrier_json("dispatch", {"node": name})
+    print(f"DISPATCHED node={name} task={task}", flush=True)
 
     # 3. Signal completion with the command we executed.
-    await signal("done", {"node": name, "cmd": cmd})
+    await signal("done", {"node": name, "cmd": task["cmd"], "ops": task["ops"]})
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 from typing import (
     Any,
@@ -384,19 +385,27 @@ class Cluster:
     async def release(
         self,
         name: str,
-        body: Union[str, bytes] = "",
+        body: Any = "",
         *,
         node: Optional[str] = None,
         status: int = 200,
     ) -> Dict[str, Any]:
-        """Releases guests blocked on ``http://rewind/barrier/<name>`` with HTTP ``body``."""
+        """Releases guests blocked on ``http://rewind/barrier/<name>`` with HTTP ``body``.
+
+        ``body`` may be ``str``, ``bytes``, ``None`` (empty), or any JSON-serializable
+        object (``dict``, ``list``, etc.), which is automatically JSON-encoded.
+        """
         params: Dict[str, Any] = {"name": name, "status": status}
         if node is not None:
             params["node"] = node
-        if isinstance(body, bytes):
+        if body is None:
+            params["body"] = ""
+        elif isinstance(body, bytes):
             params["body_base64"] = base64.b64encode(body).decode("ascii")
-        else:
+        elif isinstance(body, str):
             params["body"] = body
+        else:
+            params["body"] = json.dumps(body)
         return await self._rpc.call("cluster.release", params)
 
     async def signals(self, *, since: int = 0) -> List[SignalEvent]:

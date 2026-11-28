@@ -172,6 +172,17 @@ class GuestClient:
         raw = await self.barrier_bytes(name, payload, timeout=timeout)
         return raw.decode("utf-8", errors="replace")
 
+    async def barrier_json(
+        self,
+        name: str,
+        payload: Any = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Blocks on ``/barrier/<name>`` and parses the host release body as JSON."""
+        text = await self.barrier(name, payload, timeout=timeout)
+        return json.loads(text)
+
 
 async def meta(
     *, base_url: str = DEFAULT_CONTROL_URL, timeout: float = 30.0
@@ -211,3 +222,14 @@ async def barrier(
 ) -> str:
     """Blocks inside a guest on ``http://rewind/barrier/<name>`` until host release."""
     return await GuestClient(base_url).barrier(name, payload, timeout=timeout)
+
+
+async def barrier_json(
+    name: str,
+    payload: Any = None,
+    *,
+    base_url: str = DEFAULT_CONTROL_URL,
+    timeout: Optional[float] = None,
+) -> Any:
+    """Blocks inside a guest on ``http://rewind/barrier/<name>`` and parses JSON."""
+    return await GuestClient(base_url).barrier_json(name, payload, timeout=timeout)

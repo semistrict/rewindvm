@@ -84,27 +84,27 @@ async def main() -> None:
         # 3. Snapshot while all 3 nodes are parked inside `GET http://rewind/barrier/dispatch`!
         snap = await c.snapshot("at-barrier")
 
-        # Branch A: release with "alpha"
-        rel_a = await c.release("dispatch", "alpha")
+        # Branch A: release with structured JSON payload
+        rel_a = await c.release("dispatch", {"cmd": "alpha", "ops": 10})
         assert rel_a["released"] == 3, rel_a
         done_a = {}
         while len(done_a) < 3:
             sig = await c.wait_signal("done", timeout_ms=20_000)
             assert sig is not None
-            done_a[sig.node] = sig.json()["cmd"]
-        assert all(v == "alpha" for v in done_a.values()), done_a
+            done_a[sig.node] = sig.json()
+        assert all(v["cmd"] == "alpha" and v["ops"] == 10 for v in done_a.values()), done_a
         print(f"[Branch A] all 3 nodes completed: {done_a}", flush=True)
 
-        # 4. Restore back to `at-barrier` and release with "beta" instead!
+        # 4. Restore back to `at-barrier` and release with a different JSON payload!
         await c.restore(snap)
-        rel_b = await c.release("dispatch", "beta")
+        rel_b = await c.release("dispatch", {"cmd": "beta", "ops": 25})
         assert rel_b["released"] == 3, rel_b
         done_b = {}
         while len(done_b) < 3:
             sig = await c.wait_signal("done", timeout_ms=20_000)
             assert sig is not None
-            done_b[sig.node] = sig.json()["cmd"]
-        assert all(v == "beta" for v in done_b.values()), done_b
+            done_b[sig.node] = sig.json()
+        assert all(v["cmd"] == "beta" and v["ops"] == 25 for v in done_b.values()), done_b
         print(f"[Branch B] all 3 nodes completed: {done_b}", flush=True)
 
         # Wait for all 3 nodes to exit cleanly.
