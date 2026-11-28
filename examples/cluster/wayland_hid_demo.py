@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 
-from rewind_cluster import Cluster
+from rewind import Cluster
 
 GUEST_DIR = Path(__file__).with_name("wayland_hid")
 

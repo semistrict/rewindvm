@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 
-from rewind_cluster import Cluster
+from rewind import Cluster
 
 RUNNER_SCRIPT = Path(__file__).with_name("umami_playwright_runner.py").read_text(
     encoding="utf-8"

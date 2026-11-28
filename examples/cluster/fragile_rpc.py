@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 
-from rewind_cluster import Cluster, Nemesis
+from rewind import Cluster, Nemesis
 
 
 async def main() -> None:
